@@ -51,3 +51,26 @@ compare the complete ordered legal root action domain. No Dynamic MADS bounds
 or certification result may participate in constructing the graph or its
 values. Agent A's API is intentionally not referenced here; integration is a
 follow-up once its public contract exists.
+
+## MADS-02F-B differential
+
+`mads_v1::tests::adversarial_control_differential_checks_every_interval_and_root_certificate`
+uses the exact shared synthetic control graph builder from this module. It
+solves the graph first with the independent oracle, then checks every admitted
+MADS node and every root-action interval after each single expansion. It
+asserts the complete ordered root action domain remains present, unexpanded
+root actions retain UNKNOWN bounds, interim certificates are oracle-optimal,
+and the final result has exact root value and the full tied optimal set.
+
+## Engine multi-action enumeration probe result
+
+The existing multi-action Burn Main1 state does not yet produce a complete
+small engine fixture: its full action domain is reproducible, but continuation
+enumeration is not captured to terminal. The current graph enumerator fails
+closed on targeted spells (`ChooseTargets`), nonempty attacker subsets, and
+other unsupported decisions. The tiny fully enumerated position has only the
+forced root `Pass`. A lethal Bolt construction would enter the unsupported
+target-choice protocol, so it cannot honestly establish competing root
+terminal values with this adapter. No engine outcomes are manufactured; an
+engine-backed multi-action graph remains blocked on complete, bounded support
+for reachable decision protocols.

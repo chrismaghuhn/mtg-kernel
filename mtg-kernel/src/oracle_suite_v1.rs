@@ -542,6 +542,73 @@ impl fmt::Display for FixtureNodeId {
     }
 }
 
+/// Shared synthetic control graph used by the independent oracle and MADS
+/// differential tests. This graph is not an engine-derived Magic position.
+#[cfg(test)]
+pub(crate) fn adversarial_control_fixture_v1() -> OracleFixtureV1 {
+    let edge = |order, stable_id: &str, child| FixtureEdgeV1 {
+        stable_id: stable_id.to_owned(),
+        order,
+        child: FixtureNodeId(child),
+        estimated_cost_bucket: 0,
+    };
+    OracleFixtureV1 {
+        fixture_id: "mads02f-synthetic-adversarial-control-v1".to_owned(),
+        root: FixtureNodeId(0),
+        root_player: FixturePlayerV1::P0,
+        nodes: vec![
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(0),
+                actor: FixturePlayerV1::P0,
+                actions: vec![
+                    edge(0, "safe-a", 1),
+                    edge(1, "safe-b", 2),
+                    edge(2, "risky", 3),
+                ],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(1),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "allow-win", 4), edge(1, "force-draw", 5)],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(2),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "allow-win-too", 6), edge(1, "force-draw-too", 7)],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(3),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "punish", 8), edge(1, "spare", 9)],
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(4),
+                outcome: FixtureOutcomeV1::Win,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(5),
+                outcome: FixtureOutcomeV1::Draw,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(6),
+                outcome: FixtureOutcomeV1::Win,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(7),
+                outcome: FixtureOutcomeV1::Draw,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(8),
+                outcome: FixtureOutcomeV1::Loss,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(9),
+                outcome: FixtureOutcomeV1::Draw,
+            },
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,61 +811,7 @@ mod tests {
     /// MADS-02B all-win, forced-Pass engine position.
     #[test]
     fn adversarial_control_fixture_has_mixed_values_ties_and_max_min_switches() {
-        let f = OracleFixtureV1 {
-            fixture_id: "mads02f-synthetic-adversarial-control-v1".to_owned(),
-            root: FixtureNodeId(0),
-            root_player: FixturePlayerV1::P0,
-            nodes: vec![
-                OracleNodeV1::GameDecision {
-                    id: FixtureNodeId(0),
-                    actor: FixturePlayerV1::P0,
-                    actions: vec![
-                        edge(0, "safe-a", 1),
-                        edge(1, "safe-b", 2),
-                        edge(2, "risky", 3),
-                    ],
-                },
-                OracleNodeV1::GameDecision {
-                    id: FixtureNodeId(1),
-                    actor: FixturePlayerV1::P1,
-                    actions: vec![edge(0, "allow-win", 4), edge(1, "force-draw", 5)],
-                },
-                OracleNodeV1::GameDecision {
-                    id: FixtureNodeId(2),
-                    actor: FixturePlayerV1::P1,
-                    actions: vec![edge(0, "allow-win-too", 6), edge(1, "force-draw-too", 7)],
-                },
-                OracleNodeV1::GameDecision {
-                    id: FixtureNodeId(3),
-                    actor: FixturePlayerV1::P1,
-                    actions: vec![edge(0, "punish", 8), edge(1, "spare", 9)],
-                },
-                OracleNodeV1::Terminal {
-                    id: FixtureNodeId(4),
-                    outcome: FixtureOutcomeV1::Win,
-                },
-                OracleNodeV1::Terminal {
-                    id: FixtureNodeId(5),
-                    outcome: FixtureOutcomeV1::Draw,
-                },
-                OracleNodeV1::Terminal {
-                    id: FixtureNodeId(6),
-                    outcome: FixtureOutcomeV1::Win,
-                },
-                OracleNodeV1::Terminal {
-                    id: FixtureNodeId(7),
-                    outcome: FixtureOutcomeV1::Draw,
-                },
-                OracleNodeV1::Terminal {
-                    id: FixtureNodeId(8),
-                    outcome: FixtureOutcomeV1::Loss,
-                },
-                OracleNodeV1::Terminal {
-                    id: FixtureNodeId(9),
-                    outcome: FixtureOutcomeV1::Draw,
-                },
-            ],
-        };
+        let f = adversarial_control_fixture_v1();
         let result = f.solve_oracle_v1().unwrap();
         assert_eq!(result.root_value, 0);
         assert_eq!(result.optimal_root_actions, ["safe-a", "safe-b"]);
