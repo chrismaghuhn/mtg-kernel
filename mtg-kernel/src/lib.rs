@@ -57,6 +57,7 @@ pub mod durable_move_publication_v2;
 // Strict Python-authoritative initial-model snapshot loader for matched trials.
 #[allow(dead_code)]
 pub(crate) mod common_model_snapshot_v1;
+pub mod dynamic_engine_search_v1;
 pub mod effect;
 pub mod engine;
 pub mod event;

@@ -20,6 +20,57 @@ pub const WIN_V1: i8 = 1;
 pub const FRONTIER_POLICY_V1: &str = "FRONTIER_REBUILD_REFERENCE";
 pub const ACTION_ADMISSION_V1: &str = "EAGER_ACTION_ADMISSION";
 
+/// Shared conservative interval backup used by fixture and dynamic engine
+/// graphs. Missing action slots retain the full UNKNOWN envelope.
+pub(crate) fn backup_bounds_v1(
+    role: MadsRoleV1,
+    children: &[BoundIntervalV1],
+    slots: usize,
+) -> BoundIntervalV1 {
+    if children.is_empty() {
+        return BoundIntervalV1::UNKNOWN;
+    }
+    let complete = children.len() == slots;
+    match (role, complete) {
+        (MadsRoleV1::Max, false) => BoundIntervalV1 {
+            lower: children.iter().map(|b| b.lower).max().unwrap_or(LOSS_V1),
+            upper: WIN_V1,
+        },
+        (MadsRoleV1::Min, false) => BoundIntervalV1 {
+            lower: LOSS_V1,
+            upper: children.iter().map(|b| b.upper).min().unwrap_or(WIN_V1),
+        },
+        (MadsRoleV1::Max, true) => BoundIntervalV1 {
+            lower: children.iter().map(|b| b.lower).max().unwrap_or(LOSS_V1),
+            upper: children.iter().map(|b| b.upper).max().unwrap_or(LOSS_V1),
+        },
+        (MadsRoleV1::Min, true) => BoundIntervalV1 {
+            lower: children.iter().map(|b| b.lower).min().unwrap_or(WIN_V1),
+            upper: children.iter().map(|b| b.upper).min().unwrap_or(WIN_V1),
+        },
+    }
+}
+
+/// Shared root-critical support predicate used by the fixture and dynamic
+/// engine frontiers. `incumbent` selects lower-bound support; otherwise upper.
+pub(crate) fn critical_support_v1(
+    role: MadsRoleV1,
+    incumbent: bool,
+    parent: BoundIntervalV1,
+    child: Option<BoundIntervalV1>,
+) -> bool {
+    match (incumbent, role, child) {
+        (true, MadsRoleV1::Max, Some(child)) => child.lower == parent.lower,
+        (true, MadsRoleV1::Max, None) => parent.lower == LOSS_V1,
+        (true, MadsRoleV1::Min, Some(child)) => child.lower == parent.lower,
+        (true, MadsRoleV1::Min, None) => true,
+        (false, MadsRoleV1::Min, Some(child)) => child.upper == parent.upper,
+        (false, MadsRoleV1::Min, None) => parent.upper == WIN_V1,
+        (false, MadsRoleV1::Max, Some(child)) => child.upper == parent.upper,
+        (false, MadsRoleV1::Max, None) => true,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MadsRoleV1 {
     Max,
@@ -672,60 +723,19 @@ impl<'a> MadsGraphV1<'a> {
             .enumerate()
             .filter(|(_, slot)| slot.child.is_none())
             .collect::<Vec<_>>();
-        let (selected_expanded, select_unexpanded) = match (role, node_role) {
-            (CriticalRoleV1::IncumbentLower, MadsRoleV1::Max) => (
-                expanded
-                    .iter()
-                    .copied()
-                    .filter(|slot| {
-                        slot.child.is_some_and(|child| {
-                            self.nodes[child].bounds().lower == parent_bounds.lower
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                parent_bounds.lower == LOSS_V1,
-            ),
-            (CriticalRoleV1::IncumbentLower, MadsRoleV1::Min) => (
-                expanded
-                    .iter()
-                    .copied()
-                    .filter(|slot| {
-                        slot.child.is_some_and(|child| {
-                            self.nodes[child].bounds().lower == parent_bounds.lower
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                !unexpanded.is_empty(),
-            ),
-            (CriticalRoleV1::ChallengerUpper, MadsRoleV1::Min) => (
-                expanded
-                    .iter()
-                    .copied()
-                    .filter(|slot| {
-                        slot.child.is_some_and(|child| {
-                            self.nodes[child].bounds().upper == parent_bounds.upper
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                parent_bounds.upper == WIN_V1,
-            ),
-            (CriticalRoleV1::ChallengerUpper, MadsRoleV1::Max) => (
-                expanded
-                    .iter()
-                    .copied()
-                    .filter(|slot| {
-                        slot.child.is_some_and(|child| {
-                            self.nodes[child].bounds().upper == parent_bounds.upper
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                !unexpanded.is_empty(),
-            ),
-        };
+        let incumbent = role == CriticalRoleV1::IncumbentLower;
+        let selected_expanded = expanded
+            .iter()
+            .copied()
+            .filter(|slot| {
+                let child = slot.child.map(|child| self.nodes[child].bounds());
+                critical_support_v1(node_role, incumbent, parent_bounds, child)
+            })
+            .collect::<Vec<_>>();
 
         let node_distance = distance.saturating_add(1);
         for (slot_index, _) in unexpanded {
-            if select_unexpanded {
+            if critical_support_v1(node_role, incumbent, parent_bounds, None) {
                 self.insert_task(node_index, slot_index, role, root_order, distance, tasks)?;
             }
         }
@@ -932,33 +942,7 @@ impl<'a> MadsGraphV1<'a> {
             .iter()
             .filter_map(|slot| slot.child.map(|child| self.nodes[child].bounds()))
             .collect::<Vec<_>>();
-        let has_unexpanded = expanded.len() < slots.len();
-        if expanded.is_empty() {
-            return Ok(BoundIntervalV1::UNKNOWN);
-        }
-        let bounds = if has_unexpanded {
-            match role {
-                MadsRoleV1::Max => BoundIntervalV1 {
-                    lower: expanded.iter().map(|b| b.lower).max().unwrap_or(LOSS_V1),
-                    upper: WIN_V1,
-                },
-                MadsRoleV1::Min => BoundIntervalV1 {
-                    lower: LOSS_V1,
-                    upper: expanded.iter().map(|b| b.upper).min().unwrap_or(WIN_V1),
-                },
-            }
-        } else {
-            match role {
-                MadsRoleV1::Max => BoundIntervalV1 {
-                    lower: expanded.iter().map(|b| b.lower).max().unwrap_or(LOSS_V1),
-                    upper: expanded.iter().map(|b| b.upper).max().unwrap_or(LOSS_V1),
-                },
-                MadsRoleV1::Min => BoundIntervalV1 {
-                    lower: expanded.iter().map(|b| b.lower).min().unwrap_or(WIN_V1),
-                    upper: expanded.iter().map(|b| b.upper).min().unwrap_or(WIN_V1),
-                },
-            }
-        };
+        let bounds = backup_bounds_v1(role, &expanded, slots.len());
         if !bounds.is_valid() {
             return Err(MadsErrorV1::InternalInvariant(format!(
                 "invalid bounds [{}, {}] at fixture node {}",

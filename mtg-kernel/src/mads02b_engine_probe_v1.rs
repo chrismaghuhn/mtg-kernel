@@ -6,6 +6,7 @@
 //! explicitly `ENGINE_ORACLE_ONLY`; it is not a fair Magic teacher.
 
 use crate::card_def::card_id_by_name;
+use crate::dynamic_engine_search_v1::{DynamicEngineSearchV1, DynamicSearchStatusV1};
 use crate::engine::{self, Action, Decision};
 use crate::event::{self, ProposedEvent};
 use crate::ids::{ObjectId, PlayerId};
@@ -908,8 +909,74 @@ fn dynamic_tree_expands_one_successor_at_a_time_and_matches_bounded_oracle() {
 }
 
 #[test]
+fn production_dynamic_search_v1_matches_bounded_oracle_and_obeys_budget() {
+    let enumerated = enumerate_tiny_graph().expect("bounded fixture enumerates");
+    let oracle = enumerated.fixture.solve_oracle_v1().unwrap();
+    let (root_state, root_decision) = tiny_engine_root();
+    let original = root_state.clone();
+    let mut search = DynamicEngineSearchV1::new(&root_state, root_decision).unwrap();
+    let zero = search.run_v1(0);
+    assert_eq!(zero.metrics.authoritative_transitions, 0);
+    assert_eq!(
+        zero.metrics.state_clones, 1,
+        "the authoritative root is cloned once"
+    );
+    assert_eq!(zero.root_bounds, BoundIntervalV1::UNKNOWN);
+    assert!(zero.root_actions.iter().all(|a| !a.expanded));
+    assert_eq!(root_state, original);
+    for _ in 0..oracle.total_edges {
+        let before = search.run_v1(0).metrics.authoritative_transitions;
+        let result = search.run_v1(1);
+        assert_ne!(result.status, DynamicSearchStatusV1::UnsupportedDecision);
+        for (state, decision, bounds) in search.debug_nodes_v1() {
+            let values = enumerated
+                .state_nodes
+                .iter()
+                .filter(|(s, d, _)| s == &state && d == &decision)
+                .filter_map(|(_, _, id)| oracle.node_values.get(id).copied())
+                .collect::<Vec<_>>();
+            assert!(!values.is_empty());
+            assert!(
+                values
+                    .iter()
+                    .all(|v| bounds.lower <= *v && *v <= bounds.upper),
+                "MADS bound {:?} excludes oracle value {:?}",
+                bounds,
+                values
+            );
+        }
+        if result.metrics.authoritative_transitions == before {
+            break;
+        }
+    }
+    let result = search.run_v1(0);
+    assert_eq!(result.status, DynamicSearchStatusV1::Certified);
+    assert!(result
+        .exact_root_value
+        .is_none_or(|value| value == oracle.root_value));
+    assert_eq!(
+        result.certified_optimal_actions,
+        oracle.optimal_root_actions
+    );
+    assert!(result
+        .chosen_action
+        .as_ref()
+        .is_some_and(|a| oracle.optimal_root_actions.contains(a)));
+    assert!(result.metrics.authoritative_transitions as usize <= oracle.total_edges);
+    assert_eq!(root_state, original);
+}
+
+#[test]
 fn halted_is_rejected_instead_of_becoming_an_oracle_outcome() {
     let (state, decision) = tiny_engine_root();
+    assert!(DynamicEngineSearchV1::new(
+        &state,
+        Decision::Halted {
+            mechanic: engine::UnsupportedMechanic::InvalidEffectContinuation,
+            source: ObjectId(0),
+        },
+    )
+    .is_err());
     let mut dynamic = TestOnlyEngineTreeHarness::new(state.clone(), decision).unwrap();
     let prior_node_count = dynamic.nodes.len();
     let error = dynamic
