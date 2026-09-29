@@ -309,7 +309,7 @@ impl CombatScanV5 {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PolicySurfaceV5 {
     inner: HarnessSurfaceV2,
     scan: Option<CombatScanV5>,
@@ -865,6 +865,44 @@ mod tests {
         card_name, legal_action_candidates_v5, observe_policy_v5, ActionSemanticV1, PlayerSeatV1,
     };
     use crate::state::{Counters, GameObject, ObjectStateV4, Step, Zone};
+
+    #[test]
+    fn policy_surface_structural_identity_includes_private_harness_mode() {
+        let full = PolicySurfaceV5::new_with_suppression_audit_mode(SuppressionAuditMode::Full);
+        let identical = full.clone();
+        let off = PolicySurfaceV5::new_with_suppression_audit_mode(SuppressionAuditMode::Off);
+
+        assert!(full == identical);
+        assert!(full != off);
+    }
+
+    #[test]
+    fn policy_surface_structural_identity_includes_scan_order_and_cursor() {
+        let (mut state, _) = attacker_state(2);
+        let mut surface = PolicySurfaceV5::new();
+        surface.next_decision(&mut state).unwrap();
+        let base = surface;
+        assert!(base.scan_active());
+
+        let mut different_cursor = base.clone();
+        if let Some(CombatScanV5::Attackers { cursor, .. }) = &mut different_cursor.scan {
+            *cursor += 1;
+        } else {
+            panic!("attacker scan expected");
+        }
+        assert!(base != different_cursor);
+
+        let mut different_order = base.clone();
+        if let Some(CombatScanV5::Attackers {
+            ordered_candidates, ..
+        }) = &mut different_order.scan
+        {
+            ordered_candidates.reverse();
+        } else {
+            panic!("attacker scan expected");
+        }
+        assert!(base != different_order);
+    }
 
     fn attacker_state(count: usize) -> (GameState, Vec<ObjectId>) {
         let mut state = GameState::new_from_libraries(&[], &[], card_name, 91);

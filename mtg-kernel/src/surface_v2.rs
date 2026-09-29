@@ -244,7 +244,7 @@ pub fn verify_corpus_provenance(manifest_java_oracle_commit: &str) -> Result<(),
     Ok(())
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct BlockersReshape {
     remaining: std::collections::VecDeque<(ObjectId, Vec<ObjectId>)>,
     accumulated: Vec<(ObjectId, ObjectId)>,
@@ -319,7 +319,7 @@ pub struct OptionalCostReshapePublicV2 {
 /// from both) -- so, unlike the sibling `ChooseCostTargets`/`SacrificeLands`
 /// reshape, no per-pick "down to 1 candidate, auto-finish" shortcut is ever
 /// reachable here and none is implemented.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct DiscardReshape {
     player: PlayerId,
     remaining_choices: Vec<ObjectId>,
@@ -356,7 +356,7 @@ struct DiscardReshape {
 /// continuation/force helpers, `replay_burn_v2.rs`'s own best-effort
 /// look-ahead guess, none of which have real per-stage ground truth to
 /// begin with) keeps constructing that single answer unchanged.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct OptionalCostReshape {
     player: crate::ids::PlayerId,
     discard_payable: bool,
@@ -437,7 +437,7 @@ impl SuppressionCounts {
 /// See the module doc. Structurally identical to `HarnessSurfaceV1` (same
 /// four suppression rules, same blockers-reshape bookkeeping) but a
 /// separate type, per the H2 contract.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HarnessSurfaceV2 {
     suppression_audit_mode: SuppressionAuditMode,
     suppression_counts: SuppressionCounts,
