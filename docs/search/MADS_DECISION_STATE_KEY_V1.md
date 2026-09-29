@@ -2,7 +2,7 @@
 
 **Status: NOT PROVEN. Real-engine transposition-table reuse is blocked.**
 
-Audit baseline: `master` at `1265b62c1a0d22e6f3bcc853c4e355fbc696c90f`.
+Audit baseline: `main` at `4833d614cc6baca39c407a00eb3ffd30d0714f20` (MADS-02D).
 Rust 1.94.1. This audit does not import Manafold's identity contracts.
 
 ## 1. Identity questions are distinct
@@ -180,3 +180,74 @@ For every proposed equivalent pair, compare the full legal decision protocol, te
 | Real-engine transposition table | BLOCKED |
 | Isolated OracleFixtureId identity | ALLOWED only within a self-contained fixture; fixture IDs are exact semantic identity by construction |
 | Fair perfect-information MTG search adapter | NOT IMPLEMENTED; hidden-information firewall applies |
+
+## 11. MADS-02D paired-state audit
+
+The production source at the audited commit was re-read for the concrete
+top-level field lists. `GameState` currently stores `objects`, `players`,
+`turn`, `active_player`, `priority_player`, `starting_player`, `step`,
+`stack`, `exile`, `command`, `initiative`, `library_knowledge`,
+`hand_knowledge`, the private `GameRandomnessState`, and `engine`.
+`GameState` implements structural `PartialEq + Eq`; its manual `Hash`
+includes those values, including the non-default starting player. The
+randomness enum preserves legacy SplitMix64 state or environment-v2 state.
+This makes whole-GameState equality a usable conservative comparison for
+that struct, but it is not a DecisionStateKey: a `Decision`, policy surface,
+candidate order, actor-facing observation, session counters, and search
+namespace are outside it.
+
+`EngineState` currently stores `next_stack_item_id`, `priority_passes`,
+`priority_round`, `stack_len_at_round_open`, `pending_cast`,
+`pending_activation`, `pending_discard`, `pending_optional_cost`,
+`pending_optional_cost_sacrifice`, `pending_spell_copy`, `pending_effect`,
+`event_log`, `event_history`, `active_replacements`, `next_replacement_id`,
+`linked_exile_records`, `pending_triggers`, `combat`, `until_end_of_turn`,
+`mana_ability_activations`, `mana_ability_count_at_round_open`,
+`pending_kicked_source`, `exile_play_permissions`, `next_effect_timestamp`,
+`halted`, `last_mana_ability_activator`, `pending_land_play`,
+`initiative_source`, and `until_next_turn_keywords`. Its derived structural
+equality/hash recursively covers these values. In particular, an
+`EffectContinuation` owns the resolving `StackItem`, `ExecCtx`, remaining
+`EffectFrame`s, pending typed choice, and answered-choice guard; nested
+frames/guards and their bindings therefore compare recursively.
+
+The new unit test `exact_state_pairs_reject_future_relevant_differences`
+constructs states with the same empty battlefield and checks that structural
+equality rejects pairs differing only in (a) ordered library cards, (b) the
+legacy RNG cursor, (c) priority player, (d) next stack-item allocator value,
+or (e) priority-pass bookkeeping. It does not claim that hash inequality
+proves semantics; the assertions use `GameState` equality. These are negative
+merge examples, not a proof that every exact GameState-equal pair has equal
+future policy protocol behavior.
+
+### Exact-identity proof status and TT release criteria
+
+The GameState portion has a conservative exact comparison available by
+cloning/retaining the value and comparing `Eq`; neither `state_hash()` nor
+`diagnostic_state_hash()` is suitable as the equality test. No session-wide
+key currently captures and compares all live `Decision`, `PolicySurfaceV5`,
+construction progress, candidate ordering, session/revision bindings,
+and namespace data. Therefore overall MADS DecisionStateKey status remains
+**NOT PROVEN**, and the production TT reuse gate remains **CLOSED**.
+
+Opening the gate requires all of the following: (1) a versioned owned key
+with exact equality after hash bucket lookup; (2) exhaustive field mapping
+for GameState, recursively nested EngineState/continuations, current decision,
+surface scan/construction state, candidate order, and session bindings; (3)
+paired-state tests for every proposed normalization/exclusion, including
+observations, legal choices, terminal outcome, successors, and deterministic
+randomness; (4) namespace separation for engine/rules/card data, schemas,
+RNG contract, and key version; and (5) tests showing actor-visible key and
+observation projections never include opponent private card identities or
+authoritative future RNG. Until then, only isolated `OracleFixtureId` reuse
+inside one immutable fixture is allowed.
+
+### Hidden-information gate
+
+The authoritative GameState equality is privileged and includes both
+players' ordered libraries and hands, as well as both observers' knowledge
+rows. It must never be passed to a policy-facing key or observation. An
+actor-visible information-set key must be independently derived from that
+actor's authorized observation/knowledge projection and must not include
+opponent hidden object identities, unseen library order, or future RNG state.
+No such real-game adapter is implemented or proven at this commit.
