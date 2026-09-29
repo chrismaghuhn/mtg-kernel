@@ -6,6 +6,9 @@
 //! explicitly `ENGINE_ORACLE_ONLY`; it is not a fair Magic teacher.
 
 use crate::card_def::card_id_by_name;
+use crate::dynamic_engine_search_v1::{
+    DynamicEngineSearchV1, DynamicSearchErrorV1, DynamicSearchStatusV1,
+};
 use crate::engine::{self, Action, Decision};
 use crate::event::{self, ProposedEvent};
 use crate::ids::{ObjectId, PlayerId};
@@ -173,6 +176,16 @@ fn real_pauper_burn_cast_or_pass_domain_is_complete_and_reproducible() {
     assert!(expected.len() >= 2);
     assert!(matches!(decision_a, Decision::CastSpellOrPass { .. }));
     assert_eq!(state_a.step, crate::state::Step::Main1);
+    let mut incomplete = decision_a.clone();
+    let Decision::CastSpellOrPass { land_drops, .. } = &mut incomplete else {
+        unreachable!()
+    };
+    assert!(land_drops.len() >= 2);
+    land_drops.pop();
+    assert_eq!(
+        DynamicEngineSearchV1::new(&state_a, incomplete).unwrap_err(),
+        DynamicSearchErrorV1::InvalidDecisionFrame
+    );
 
     let semantics = projected.iter().map(|row| &row.0).collect::<Vec<_>>();
     let stable_ids = projected.iter().map(|row| &row.1).collect::<Vec<_>>();
@@ -908,8 +921,302 @@ fn dynamic_tree_expands_one_successor_at_a_time_and_matches_bounded_oracle() {
 }
 
 #[test]
+fn production_dynamic_search_v1_matches_bounded_oracle_and_obeys_budget() {
+    let enumerated = enumerate_tiny_graph().expect("bounded fixture enumerates");
+    let oracle = enumerated.fixture.solve_oracle_v1().unwrap();
+    let (root_state, root_decision) = tiny_engine_root();
+    let original = root_state.clone();
+    let mut search = DynamicEngineSearchV1::new(&root_state, root_decision).unwrap();
+    let zero = search.run_v1(0);
+    assert_eq!(zero.metrics.authoritative_transitions, 0);
+    assert_eq!(
+        zero.metrics.state_clones, 1,
+        "the authoritative root is cloned once"
+    );
+    assert_eq!(zero.root_bounds, BoundIntervalV1::UNKNOWN);
+    assert!(zero.root_actions.iter().all(|a| !a.expanded));
+    assert_eq!(root_state, original);
+    for _ in 0..oracle.total_edges {
+        let before = search.run_v1(0).metrics.authoritative_transitions;
+        let result = search.run_v1(1);
+        assert_ne!(result.status, DynamicSearchStatusV1::UnsupportedDecision);
+        for (state, decision, bounds) in search.debug_nodes_v1() {
+            let values = enumerated
+                .state_nodes
+                .iter()
+                .filter(|(s, d, _)| s == &state && d == &decision)
+                .filter_map(|(_, _, id)| oracle.node_values.get(id).copied())
+                .collect::<Vec<_>>();
+            assert!(!values.is_empty());
+            assert!(
+                values
+                    .iter()
+                    .all(|v| bounds.lower <= *v && *v <= bounds.upper),
+                "MADS bound {:?} excludes oracle value {:?}",
+                bounds,
+                values
+            );
+        }
+        if result.metrics.authoritative_transitions == before {
+            break;
+        }
+    }
+    let result = search.run_v1(0);
+    assert_eq!(result.status, DynamicSearchStatusV1::Certified);
+    assert!(result.root_bounds.lower <= oracle.root_value);
+    assert!(oracle.root_value <= result.root_bounds.upper);
+    assert_eq!(
+        result.exact_root_value,
+        (result.root_bounds.lower == result.root_bounds.upper).then_some(result.root_bounds.lower)
+    );
+    assert_eq!(
+        result.certified_optimal_actions,
+        oracle.optimal_root_actions
+    );
+    assert!(result
+        .chosen_action
+        .as_ref()
+        .is_some_and(|a| oracle.optimal_root_actions.contains(a)));
+    let certified_id = result.chosen_action.as_ref().unwrap();
+    assert_eq!(
+        result.chosen_engine_action,
+        result
+            .root_actions
+            .iter()
+            .find(|action| &action.stable_id == certified_id)
+            .map(|action| action.engine_action.clone())
+    );
+    let after_certificate_failure =
+        search.debug_result_with_status_v1(DynamicSearchStatusV1::UnsupportedDecision);
+    assert_eq!(
+        after_certificate_failure.status,
+        DynamicSearchStatusV1::UnsupportedDecision
+    );
+    assert_eq!(
+        after_certificate_failure.chosen_action,
+        result.chosen_action
+    );
+    assert_eq!(
+        after_certificate_failure.chosen_engine_action,
+        result.chosen_engine_action
+    );
+    assert!(result.metrics.authoritative_transitions as usize <= oracle.total_edges);
+    assert_eq!(root_state, original);
+}
+
+#[test]
+fn dynamic_frontier_support_matches_mads01_through_complete_relevant_frontier() {
+    let enumerated = enumerate_tiny_graph().expect("bounded fixture enumerates");
+    let (root_state, root_decision) = tiny_engine_root();
+    let mut dynamic = DynamicEngineSearchV1::new(&root_state, root_decision).unwrap();
+    let mut reference = MadsGraphV1::new(&enumerated.fixture).unwrap();
+    let mut expanded = 0;
+    loop {
+        let reference_frontier = reference.rebuild_frontier_v1().unwrap().to_vec();
+        let mut expected = reference_frontier
+            .iter()
+            .map(|task| {
+                (
+                    task.action_id.clone(),
+                    u8::from(
+                        task.role_mask
+                            .contains(crate::mads_v1::ExpansionRoleMaskV1::INCUMBENT_LOWER),
+                    ) | (u8::from(
+                        task.role_mask
+                            .contains(crate::mads_v1::ExpansionRoleMaskV1::CHALLENGER_UPPER),
+                    ) << 1),
+                    task.bound_width,
+                    task.min_root_distance,
+                    task.estimated_cost_bucket,
+                    task.owner_semantic_path.clone(),
+                    task.root_action_support
+                        .iter()
+                        .map(|&root| root as usize)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut actual = dynamic.debug_frontier_v1();
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected, "critical support task sets differ");
+        let Some(task) = reference_frontier.first() else {
+            break;
+        };
+        let picked = reference
+            .expand_next_v1()
+            .unwrap()
+            .expect("frontier task exists");
+        assert_eq!(picked.action_id, task.action_id);
+        dynamic
+            .debug_expand_semantic_task_v1(&task.owner_semantic_path, &task.action_id)
+            .expect("matching dynamic action expands");
+        expanded += 1;
+    }
+    assert!(
+        expanded > 64,
+        "test must traverse the entire relevant frontier"
+    );
+    assert_eq!(expanded as u64, reference.metrics().expanded_actions);
+}
+
+#[test]
+fn legacy_fixture_id_tiebreak_and_dynamic_path_tiebreak_are_versioned_separately() {
+    let fixture = OracleFixtureV1 {
+        fixture_id: "fixture-id-vs-path-order-v1".to_owned(),
+        root: FixtureNodeId(100),
+        root_player: FixturePlayerV1::P0,
+        nodes: vec![
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(100),
+                actor: FixturePlayerV1::P0,
+                actions: vec![FixtureEdgeV1 {
+                    stable_id: "root".into(),
+                    order: 0,
+                    child: FixtureNodeId(50),
+                    estimated_cost_bucket: 1,
+                }],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(50),
+                actor: FixturePlayerV1::P0,
+                actions: vec![
+                    FixtureEdgeV1 {
+                        stable_id: "path-00".into(),
+                        order: 0,
+                        child: FixtureNodeId(90),
+                        estimated_cost_bucket: 1,
+                    },
+                    FixtureEdgeV1 {
+                        stable_id: "path-01".into(),
+                        order: 1,
+                        child: FixtureNodeId(20),
+                        estimated_cost_bucket: 1,
+                    },
+                ],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(90),
+                actor: FixturePlayerV1::P1,
+                actions: vec![FixtureEdgeV1 {
+                    stable_id: "leaf-00".into(),
+                    order: 0,
+                    child: FixtureNodeId(91),
+                    estimated_cost_bucket: 1,
+                }],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(20),
+                actor: FixturePlayerV1::P1,
+                actions: vec![FixtureEdgeV1 {
+                    stable_id: "leaf-01".into(),
+                    order: 0,
+                    child: FixtureNodeId(21),
+                    estimated_cost_bucket: 1,
+                }],
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(91),
+                outcome: FixtureOutcomeV1::Loss,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(21),
+                outcome: FixtureOutcomeV1::Loss,
+            },
+        ],
+    };
+    let mut reference = MadsGraphV1::new(&fixture).unwrap();
+    for _ in 0..3 {
+        reference
+            .expand_next_v1()
+            .unwrap()
+            .expect("fixture frontier expands");
+    }
+    let frontier = reference.rebuild_frontier_v1().unwrap();
+    let fixture_id_first = frontier.first().unwrap();
+    let path_first = frontier
+        .iter()
+        .min_by_key(|task| &task.owner_semantic_path)
+        .unwrap();
+    assert_eq!(fixture_id_first.owner, FixtureNodeId(20));
+    assert_eq!(fixture_id_first.owner_semantic_path, [0, 1]);
+    assert_eq!(path_first.owner, FixtureNodeId(90));
+    assert_eq!(path_first.owner_semantic_path, [0, 0]);
+    assert!(
+        crate::dynamic_engine_search_v1::dynamic_path_frontier_sort_key_v1(
+            crate::mads_v1::ExpansionRoleMaskV1::INCUMBENT_LOWER,
+            2,
+            2,
+            1,
+            vec![0, 0],
+            crate::mads_v1::ExpansionSemanticOrderV1::GameAction { action_order: 0 },
+        ) < crate::dynamic_engine_search_v1::dynamic_path_frontier_sort_key_v1(
+            crate::mads_v1::ExpansionRoleMaskV1::INCUMBENT_LOWER,
+            2,
+            2,
+            1,
+            vec![0, 1],
+            crate::mads_v1::ExpansionSemanticOrderV1::GameAction { action_order: 0 },
+        )
+    );
+}
+
+#[test]
+fn dynamic_frontier_orders_incumbent_before_challenger_for_full_burn_root() {
+    let (state, decision) = first_nontrivial_burn_main1(BURN_PROBE_SEED);
+    let actions = complete_cast_or_pass_domain(&decision, &state).unwrap();
+    let edges = actions
+        .iter()
+        .enumerate()
+        .map(|(order, action)| FixtureEdgeV1 {
+            stable_id: stable_fixture_action_id(action).unwrap(),
+            order: order as u32,
+            child: FixtureNodeId(order as u32 + 1),
+            estimated_cost_bucket: 1,
+        })
+        .collect::<Vec<_>>();
+    let mut nodes = vec![OracleNodeV1::GameDecision {
+        id: FixtureNodeId(0),
+        actor: FixturePlayerV1::P0,
+        actions: edges,
+    }];
+    nodes.extend((1..=actions.len()).map(|id| OracleNodeV1::Terminal {
+        id: FixtureNodeId(id as u32),
+        outcome: FixtureOutcomeV1::Loss,
+    }));
+    let fixture = OracleFixtureV1 {
+        fixture_id: "dynamic-root-frontier-role-order-v1".to_owned(),
+        root: FixtureNodeId(0),
+        root_player: FixturePlayerV1::P0,
+        nodes,
+    };
+    let mut reference = MadsGraphV1::new(&fixture).unwrap();
+    let dynamic = DynamicEngineSearchV1::new(&state, decision).unwrap();
+    let expected = reference.rebuild_frontier_v1().unwrap()[0].clone();
+    let actual = dynamic.debug_next_task_v1().unwrap();
+    assert_eq!(actual.2, expected.action_id);
+    assert_eq!(
+        actual.3,
+        crate::mads_v1::ExpansionRoleMaskV1::INCUMBENT_LOWER
+    );
+    assert_eq!(actual.4, expected.bound_width);
+    assert_eq!(actual.5, expected.min_root_distance);
+    assert_eq!(actual.6, expected.estimated_cost_bucket);
+    assert_eq!(actual.7, expected.owner_semantic_path);
+    assert_eq!(actual.8, vec![0]);
+}
+
+#[test]
 fn halted_is_rejected_instead_of_becoming_an_oracle_outcome() {
     let (state, decision) = tiny_engine_root();
+    assert!(DynamicEngineSearchV1::new(
+        &state,
+        Decision::Halted {
+            mechanic: engine::UnsupportedMechanic::InvalidEffectContinuation,
+            source: ObjectId(0),
+        },
+    )
+    .is_err());
     let mut dynamic = TestOnlyEngineTreeHarness::new(state.clone(), decision).unwrap();
     let prior_node_count = dynamic.nodes.len();
     let error = dynamic
