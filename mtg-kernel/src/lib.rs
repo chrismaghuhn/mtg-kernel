@@ -85,6 +85,8 @@ pub mod kernel_native_search_opponent_v1;
 pub mod mana;
 // MADS-01 interval graph over isolated OracleSuiteV1 decision fixtures. This
 // module is not a live-Magic searcher and does not enable an engine TT.
+#[cfg(test)]
+mod mads02b_engine_probe_v1;
 pub mod mads_v1;
 // Model-guided searcher authority record SCHEMA ONLY (design item 4,
 // `CLAUDE-MODEL-GUIDED-SEARCHER-DESIGN-V1.md` Section 1.4 / 5.3). No
