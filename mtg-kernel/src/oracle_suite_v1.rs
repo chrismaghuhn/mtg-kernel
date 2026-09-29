@@ -290,9 +290,7 @@ impl OracleFixtureV1 {
         let indexed = self.indexed_nodes()?;
         let mut colors = BTreeMap::<FixtureNodeId, u8>::new();
         let mut longest = BTreeMap::<FixtureNodeId, usize>::new();
-        for id in indexed.keys().copied() {
-            visit_shape(id, 0, &indexed, &mut colors, &mut longest)?;
-        }
+        visit_shape(self.root, 0, &indexed, &mut colors, &mut longest)?;
         if indexed.keys().any(|id| !colors.contains_key(id)) {
             return Err(OracleErrorV1::InvalidFixture("unreachable node".to_owned()));
         }

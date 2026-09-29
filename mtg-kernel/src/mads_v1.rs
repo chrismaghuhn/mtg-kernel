@@ -327,7 +327,9 @@ pub struct SearchMetricsV1 {
     pub valid_tt_hits: u64,
     pub bound_updates: u64,
     pub frontier_rebuilds: u64,
+    /// Number of `run_v1` calls which returned a certified root action.
     pub root_certifications: u64,
+    /// Number of `run_v1` calls which exhausted their budget unresolved.
     pub unknown_roots: u64,
     /// Algorithm-level fixtures execute no OS-thread CPU timer. The field is
     /// intentionally absent rather than substituting wall time for CPU time.
@@ -487,6 +489,11 @@ impl<'a> MadsGraphV1<'a> {
             };
             expansions += 1;
         }
+        if self.certified_root_actions().is_empty() {
+            self.metrics.unknown_roots += 1;
+        } else {
+            self.metrics.root_certifications += 1;
+        }
         self.metrics.wall_time += start.elapsed();
         Ok(self.result_v1())
     }
@@ -512,10 +519,6 @@ impl<'a> MadsGraphV1<'a> {
     pub fn result_v1(&self) -> SearchResultV1 {
         let actions = self.root_action_bounds_v1();
         let certified = self.certified_root_actions();
-        let incumbent = actions
-            .iter()
-            .max_by_key(|action| (action.bounds.lower, std::cmp::Reverse(action.order)))
-            .expect("root has at least one legal action");
         let anytime_action = actions
             .iter()
             .max_by(|left, right| {
@@ -539,19 +542,19 @@ impl<'a> MadsGraphV1<'a> {
             (best_other_upper.is_none_or(|upper| action_bound.bounds.lower > upper))
                 .then(|| action.clone())
         });
-        let mut metrics = self.metrics.clone();
         let status = if certified.is_empty() {
-            metrics.unknown_roots += 1;
             CertificationStatusV1::UnresolvedWithinBudget
         } else {
-            metrics.root_certifications += 1;
             CertificationStatusV1::Certified
         };
         let chosen_action = if status == CertificationStatusV1::Certified {
-            Some(incumbent.stable_id.clone())
+            certified.first().cloned()
         } else {
             None
         };
+        debug_assert!(chosen_action
+            .as_ref()
+            .is_none_or(|chosen| certified.contains(chosen)));
         let root_bounds = self.nodes[self.root_index].bounds();
         SearchResultV1 {
             status,
@@ -561,7 +564,7 @@ impl<'a> MadsGraphV1<'a> {
             root_bounds,
             root_actions: actions,
             anytime_action,
-            metrics,
+            metrics: self.metrics.clone(),
         }
     }
 
@@ -1297,6 +1300,7 @@ mod tests {
             }
         );
         assert_eq!(r.anytime_action, "a");
+        assert_eq!(search.metrics().unknown_roots, 1);
         assert_eq!(
             search.set_heuristic_v1(FixtureNodeId(0), 1.1),
             Err(MadsErrorV1::InvalidHeuristic)
@@ -1317,6 +1321,57 @@ mod tests {
         assert_eq!(result.certified_optimal_actions, vec!["alpha", "beta"]);
         assert!(result.certified_unique_action.is_none());
         assert_eq!(result.chosen_action.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn certified_choice_comes_from_the_proven_set_when_lower_bounds_tie() {
+        let f = fixture(
+            vec![edge(0, "A", 1), edge(1, "B", 2)],
+            vec![
+                terminal(1, FixtureOutcomeV1::Draw),
+                OracleNodeV1::GameDecision {
+                    id: FixtureNodeId(2),
+                    actor: FixturePlayerV1::P0,
+                    actions: vec![edge(0, "first-draw", 3), edge(1, "later-win", 4)],
+                },
+                terminal(3, FixtureOutcomeV1::Draw),
+                terminal(4, FixtureOutcomeV1::Win),
+            ],
+        );
+        let truth = oracle(&f);
+        assert_eq!(truth.root_value, WIN_V1);
+        assert_eq!(truth.optimal_root_actions, vec!["B"]);
+
+        let mut search = MadsGraphV1::new(&f).unwrap();
+        assert_eq!(search.expand_next_v1().unwrap().unwrap().action_order, 0);
+        assert_eq!(search.expand_next_v1().unwrap().unwrap().action_order, 1);
+        let last_expansion = search.expand_next_v1().unwrap().unwrap();
+        assert_eq!(last_expansion.owner, FixtureNodeId(2));
+        assert_eq!(last_expansion.action_order, 0);
+
+        let result = search.run_v1(0).unwrap();
+        assert_eq!(
+            result.root_actions[0].bounds,
+            BoundIntervalV1::exact(DRAW_V1)
+        );
+        assert_eq!(
+            result.root_actions[1].bounds,
+            BoundIntervalV1 {
+                lower: DRAW_V1,
+                upper: WIN_V1
+            }
+        );
+        assert_eq!(result.certified_optimal_actions, vec!["B"]);
+        assert_eq!(result.chosen_action.as_deref(), Some("B"));
+        assert!(result
+            .chosen_action
+            .as_ref()
+            .is_some_and(|chosen| result.certified_optimal_actions.contains(chosen)));
+        assert!(truth
+            .optimal_root_actions
+            .contains(result.chosen_action.as_ref().unwrap()));
+        assert_eq!(result.metrics.root_certifications, 1);
+        assert_eq!(search.metrics().root_certifications, 1);
     }
 
     #[test]
@@ -1411,6 +1466,24 @@ mod tests {
         assert_eq!(
             f.solve_oracle_v1().unwrap_err(),
             OracleErrorV1::CycleDetected
+        );
+    }
+
+    #[test]
+    fn unreachable_fixture_nodes_are_rejected_before_mads_search() {
+        let f = fixture(
+            vec![edge(0, "only-action", 1)],
+            vec![
+                terminal(1, FixtureOutcomeV1::Draw),
+                terminal(2, FixtureOutcomeV1::Win),
+            ],
+        );
+        let expected =
+            MadsErrorV1::Oracle(OracleErrorV1::InvalidFixture("unreachable node".to_owned()));
+        assert_eq!(MadsGraphV1::new(&f).unwrap_err(), expected);
+        assert_eq!(
+            f.solve_oracle_v1().unwrap_err().to_string(),
+            "INVALID_ORACLE_FIXTURE: fixture contains unreachable nodes"
         );
     }
 

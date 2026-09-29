@@ -10,7 +10,7 @@ Baseline: `master` at `1265b62c1a0d22e6f3bcc853c4e355fbc696c90f`.
 | OracleSuiteV1 | IMPLEMENTED | Independent full minimax over explicit deterministic fixtures; root action set, all legal fixture decisions, all reachable values and terminal classifications. Fixture caps are enforced. |
 | MADS interval graph | IMPLEMENTED | Typed game-decision, construction and terminal nodes; exact fixture-ID interning; MAX/MIN conservative partial and full interval backup; reverse-parent fixpoint worklist. |
 | Root-critical scheduler | IMPLEMENTED | `FRONTIER_REBUILD_REFERENCE`: critical support rebuild, task deduplication, role-mask union and stable tuple sort. |
-| Certified and anytime results | IMPLEMENTED | Certified output is separate from heuristic fallback; unknown remains unresolved. Heuristic values never update bounds. |
+| Certified and anytime results | IMPLEMENTED | The selected certified action is chosen from the proven optimal set; unknown remains unresolved. Heuristic values never update bounds. |
 | MTG Engine adapter / TT | NOT IMPLEMENTED | State identity is not proven; ordinary game states contain hidden hand/library/RNG information. No privileged state is exposed to an agent. |
 | CARDS, Q, POR, incremental frontier, classic search baselines | NOT IMPLEMENTED | Outside MADS-01 scope. |
 
@@ -24,16 +24,16 @@ Fixture action/continuation lists are complete and eagerly present in the fixtur
 
 ## Test evidence
 
-Focused debug and optimized Release results on Rust 1.94.1:
+Focused results on Rust 1.94.1. The initial PR commit passed the complete workspace Release suite (2,244 passed, 0 failed, 44 ignored); after the certification review correction, the targeted Debug tests and release Clippy passed. The final MADS regression group was not rebuilt in Release because its Thin-LTO test-crate rebuild was taking several minutes.
 
 ```text
 cargo test -p mtg-kernel --lib oracle_suite_v1 -- --nocapture                 => 3 passed
-cargo test -p mtg-kernel --lib mads_v1 -- --nocapture                         => 13 passed
-cargo test -p mtg-kernel --lib --release oracle_suite_v1                      => 3 passed
-cargo test -p mtg-kernel --lib --release mads_v1                              => 13 passed
+cargo test -p mtg-kernel --lib mads_v1 -- --nocapture                         => 15 passed
+cargo clippy --release --locked -p mtg-kernel --lib -- -D warnings             => passed after correction
+workspace Release tests before correction                                       => 2,244 passed, 0 failed, 44 ignored
 ```
 
-The tests cover MAX/MIN, last-action counterexamples, bound containment, shared-parent propagation, shared critical-task roles, deterministic ordering, staged-context separation, constant-hash collisions, heuristic/bound separation, cycle rejection, action-cap rejection, tiny-budget unknown, and root tie handling. No failures remain in these focused groups.
+The tests cover MAX/MIN, last-action counterexamples, bound containment, shared-parent propagation, shared critical-task roles, deterministic ordering, staged-context separation, constant-hash collisions, heuristic/bound separation, cycle and unreachable-node rejection, action-cap rejection, tiny-budget unknown, root tie handling, and the regression where only a non-incumbent action is certified. Certification metrics count `run_v1` outcomes; `result_v1` is a read-only snapshot.
 
 ## Isolated comparison smoke
 
