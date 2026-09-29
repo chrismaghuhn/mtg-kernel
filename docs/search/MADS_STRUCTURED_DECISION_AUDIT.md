@@ -1,7 +1,8 @@
 # MADS Structured Decision Audit
 
-Audit baseline: `4833d614cc6baca39c407a00eb3ffd30d0714f20` (`main`).
-MADS-02B is present in this commit. Audit branch:
+Audit baseline: `ec46cd068b7a408259e39ad1fc64fded36cf4658` (`origin/main`,
+updated for PR #11 integration). This baseline includes the prior MADS-02B,
+state-key-contract, and MADS-02F-C Oracle-stress changes. Audit branch:
 `feat/MADS-02E-structured-decisions-audit`.
 
 This document maps the current engine protocol to the MADS V0.4 distinction
@@ -28,8 +29,9 @@ It does not implement that adapter, a state key, or POR.
   and are not complete physical decisions by themselves.
 - No Engine Decision variant asks the player to choose a replacement effect.
   Implemented replacement effects are applied by the event replacement pass.
-- The real Engine `DecisionStateKey` remains `NOT_PROVEN`; all POR candidates
-  below remain disabled.
+- The real Engine `DecisionStateKey` remains `NOT_PROVEN`; the separately
+  merged state-key contract does not prove a complete live Engine identity.
+  All POR candidates below remain disabled.
 
 ## Construction-node contract required by MADS V0.4
 
@@ -303,30 +305,27 @@ binary attacker/blocker scans in `surface_v2.rs` and `policy_surface_v5.rs`.
 
 ## Validation
 
-The audit build/test commands are serialized through
-`/tmp/mtg-kernel-cargo-build.lock` and use the clone's existing `target/` cache.
-No Release/Thin-LTO or workspace build is part of this audit.
+Post-integration validation was run on the merge of the audit branch with
+`origin/main` at `ec46cd068b7a408259e39ad1fc64fded36cf4658`. Every Cargo command
+used `/tmp/mtg-kernel-cargo-build.lock`, the same clone-local `target/` cache,
+and serial execution. No Release/Thin-LTO or workspace build was run.
 
 ```text
-cargo fmt --all -- --check (under shared flock)                         => passed
-cargo check -p mtg-kernel --lib -j 3 (under shared flock)               => passed
-cargo test -p mtg-kernel --lib mads02e_structured_decision_audit_v1 -j 3
-                                                                         => 5 passed
-cargo test -p mtg-kernel --lib mads_v1 -j 3                             => 15 passed
-cargo test -p mtg-kernel --lib oracle_suite_v1 -j 3                     => 3 passed
-cargo test -p mtg-kernel --lib policy_surface_v5 -j 3                   => 11 passed
-cargo test -p mtg-kernel --lib surface_v2 -j 3                          => 20 passed
+cargo fmt --all -- --check                                               => passed
+cargo check -p mtg-kernel --lib -j 3                                     => passed
+cargo test -p mtg-kernel --lib -j 3 mads02e_structured_decision_audit_v1 => 5 passed
+cargo test -p mtg-kernel --lib -j 3 mads_v1                             => 16 passed
+cargo test -p mtg-kernel --lib -j 3 mads02f_c_oracle_stress_v1           => 7 passed
+cargo test -p mtg-kernel --lib -j 3 policy_surface_v5                   => 13 passed
+cargo test -p mtg-kernel --lib -j 3 surface_v2                          => 20 passed
 cargo test -p mtg-kernel --test burn_goldfish -j 3                      => 2 passed
-cargo clippy -p mtg-kernel --lib --tests -j 3 -- -D warnings            => passed
-cargo test -p mtg-kernel --lib policy_surface_v5 -j 3                   => 11 passed
-cargo test -p mtg-kernel --lib surface_v2 -j 3                          => 20 passed
 cargo clippy -p mtg-kernel --lib --tests -j 3 -- -D warnings            => passed
 ```
 
-The test module is restricted by `#[cfg(test)]`; it adds no production search
-or Engine API. MADS-01/OracleSuite and the existing V2/V5 combat regressions
-will be run as focused checks. The full workspace suite is intentionally not
-scheduled for this analysis-only branch.
+The audit test module is restricted by `#[cfg(test)]`; it adds no production
+search or Engine API. The 16 MADS tests and seven MADS-02F-C Oracle stress
+tests are the MADS/Oracle regressions run on this integrated commit. The full
+workspace suite is intentionally not scheduled for this analysis-only branch.
 
 ## Supported scope and blockers
 

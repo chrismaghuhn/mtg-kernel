@@ -2,7 +2,7 @@
 
 **Status: NOT PROVEN. Real-engine transposition-table reuse is blocked.**
 
-Audit baseline: `master` at `1265b62c1a0d22e6f3bcc853c4e355fbc696c90f`.
+Audit baseline: `main` at `b0193a611aef394971da4a249c9f8367bb212c92` (MADS-02D-B; includes MADS-02D at `4ee2fbfc88ec06012f012aacda4e9640c4d041c9`).
 Rust 1.94.1. This audit does not import Manafold's identity contracts.
 
 ## 1. Identity questions are distinct
@@ -174,9 +174,311 @@ For every proposed equivalent pair, compare the full legal decision protocol, te
 | Item | Status |
 |---|---|
 | Full GameState and EngineState field inventory | AUDITED; all recursively included |
-| Decision/policy-surface/session context | AUDITED; exact identity required, not presently comparable as a single Eq key |
+| Decision/policy-surface/session context | AUDITED; surface and session values now compare structurally, but no trusted live-key adapter exists |
 | NORMALIZE / EXCLUDE field with proof | NONE |
-| Full exact bootstrap MTG key | NOT PROVEN / NOT IMPLEMENTED |
+| Full exact bootstrap MTG key | NOT PROVEN; a versioned structural contract exists, no trusted engine adapter |
 | Real-engine transposition table | BLOCKED |
 | Isolated OracleFixtureId identity | ALLOWED only within a self-contained fixture; fixture IDs are exact semantic identity by construction |
 | Fair perfect-information MTG search adapter | NOT IMPLEMENTED; hidden-information firewall applies |
+
+## 11. MADS-02D paired-state audit
+
+The production source at the audited commit was re-read for the concrete
+top-level field lists. `GameState` currently stores `objects`, `players`,
+`turn`, `active_player`, `priority_player`, `starting_player`, `step`,
+`stack`, `exile`, `command`, `initiative`, `library_knowledge`,
+`hand_knowledge`, the private `GameRandomnessState`, and `engine`.
+`GameState` implements structural `PartialEq + Eq`; its manual `Hash`
+includes those values, including the non-default starting player. The
+randomness enum preserves legacy SplitMix64 state or environment-v2 state.
+This makes whole-GameState equality a usable conservative comparison for
+that struct, but it is not a DecisionStateKey: a `Decision`, policy surface,
+candidate order, actor-facing observation, session counters, and search
+namespace are outside it.
+
+`EngineState` currently stores `next_stack_item_id`, `priority_passes`,
+`priority_round`, `stack_len_at_round_open`, `pending_cast`,
+`pending_activation`, `pending_discard`, `pending_optional_cost`,
+`pending_optional_cost_sacrifice`, `pending_spell_copy`, `pending_effect`,
+`event_log`, `event_history`, `active_replacements`, `next_replacement_id`,
+`linked_exile_records`, `pending_triggers`, `combat`, `until_end_of_turn`,
+`mana_ability_activations`, `mana_ability_count_at_round_open`,
+`pending_kicked_source`, `exile_play_permissions`, `next_effect_timestamp`,
+`halted`, `last_mana_ability_activator`, `pending_land_play`,
+`initiative_source`, and `until_next_turn_keywords`. Its derived structural
+equality/hash recursively covers these values. In particular, an
+`EffectContinuation` owns the resolving `StackItem`, `ExecCtx`, remaining
+`EffectFrame`s, pending typed choice, and answered-choice guard; nested
+frames/guards and their bindings therefore compare recursively.
+
+The new unit test `exact_state_pairs_reject_future_relevant_differences`
+constructs states with the same empty battlefield and checks that structural
+equality rejects pairs differing only in (a) ordered library cards, (b) the
+legacy RNG cursor, (c) priority player, (d) next stack-item allocator value,
+or (e) priority-pass bookkeeping. It does not claim that hash inequality
+proves semantics; the assertions use `GameState` equality. These are negative
+merge examples, not a proof that every exact GameState-equal pair has equal
+future policy protocol behavior.
+
+### Exact-identity proof status and TT release criteria
+
+The GameState portion has a conservative exact comparison available by
+cloning/retaining the value and comparing `Eq`; neither `state_hash()` nor
+`diagnostic_state_hash()` is suitable as the equality test. No session-wide
+key currently captures and compares all live `Decision`, `PolicySurfaceV5`,
+construction progress, candidate ordering, session/revision bindings,
+and namespace data. Therefore overall MADS DecisionStateKey status remains
+**NOT PROVEN**, and the production TT reuse gate remains **CLOSED**.
+
+Opening the gate requires all of the following: (1) a versioned owned key
+with exact equality after hash bucket lookup; (2) exhaustive field mapping
+for GameState, recursively nested EngineState/continuations, current decision,
+surface scan/construction state, candidate order, and session bindings; (3)
+paired-state tests for every proposed normalization/exclusion, including
+observations, legal choices, terminal outcome, successors, and deterministic
+randomness; (4) namespace separation for engine/rules/card data, schemas,
+RNG contract, and key version; and (5) tests showing actor-visible key and
+observation projections never include opponent private card identities or
+authoritative future RNG. Until then, only isolated `OracleFixtureId` reuse
+inside one immutable fixture is allowed.
+
+### Hidden-information gate
+
+The authoritative GameState equality is privileged and includes both
+players' ordered libraries and hands, as well as both observers' knowledge
+rows. It must never be passed to a policy-facing key or observation. An
+actor-visible information-set key must be independently derived from that
+actor's authorized observation/knowledge projection and must not include
+opponent hidden object identities, unseen library order, or future RNG state.
+No such real-game adapter is implemented or proven at this commit.
+
+## 12. MADS-02D-B exact identity contract
+
+The successor implementation adds
+`mads_decision_state_key_v1::DecisionStateKeyContractV1`. Its structural
+comparison contains all of these components:
+
+| Component | Stored identity | Status |
+|---|---|---|
+| Engine namespace | source revision, rules contract, card database identity and hash, decision schema, policy surface version, randomization contract, scheduler contract, key schema | Included; caller-supplied and not independently authenticated |
+| Authoritative rules state | full `GameState`, including recursive `EngineState` and RNG | Structural `Eq`; included |
+| Current engine decision | complete `Decision` variant and all payload vectors/values | Structural `PartialEq`; included, order retained |
+| Policy surface | full `PolicySurfaceV5`, including H2 suppressions, counters, blocker reshape, scan/binding and debug flags | Structural `PartialEq + Eq` added; included |
+| Policy candidates | ordered `Vec<PolicyActionV5>` | Structural `PartialEq`; order retained |
+| Construction progress | caller-supplied `Option<Construction>` | Required key field, but no real-engine adapter/type yet |
+| Session | whole caller-supplied session snapshot | Structural `PartialEq` added to `RlEpisodeSessionV1` and `FastActorSessionV1`; includes counters, current record, observation/candidate/cache bindings and terminal state |
+
+The new `PartialEq` derives on `HarnessSurfaceV2`, `PolicySurfaceV5`,
+`CurrentDecisionV1`, and both session structs add comparison only. They do not
+alter serialization, action/observation schemas, or transition behavior.
+Derived comparison recursively visits every declared field, so new fields
+are included automatically. For session current decisions, candidate order,
+observation and revision bindings compare as stored. Fast actor caches and
+cached errors also compare exactly; this deliberately distinguishes cache
+representations until their irrelevance is proven.
+
+The key has no `Hash` implementation. `Decision` and action values currently
+offer structural `PartialEq`, not a marker `Eq`; any future table can use a
+hash only to select a bucket and must then call exact structural comparison.
+There is no hash-only reuse path in this module. Namespace construction
+records content/version labels but does not yet verify that source revision,
+rules, card data, schema, RNG, and scheduler arguments truthfully describe a
+running engine build.
+
+### Executable equality tests and limits
+
+Added tests cover: equal cloned key envelopes; negative envelope pairs for
+namespace, GameState/library order, engine Decision/actor, policy-surface
+cursor, ordered candidates, construction prefix, and session revision; an
+actual namespace mutation for each rules/content/schema/RNG/scheduler/key
+field; actual PolicySurface clones versus changed H2 suppression mode, scan
+cursor, and scan order; actual RL session clones versus a changed owned
+environment revision; and a FastActor session clone versus a changed flat
+action contract mode. The actual-session test also instantiates the contract
+with live `GameState`, `PolicySurfaceV5`, and `RlEpisodeSessionV1` values.
+
+These tests verify exact field comparison and conservative discrimination.
+They do not prove that all current decisions are semantically paired with
+their cached candidate vectors, that a construction snapshot is complete, or
+that distinct session identities could safely share a value. In particular,
+fixture snapshot types in the key module test generic equality mechanics;
+they are not engine adapters and do not certify future behavior.
+
+### Remaining release proof obligations
+
+**Status remains NOT PROVEN. Production TT reuse remains CLOSED.** Before
+reuse can be enabled, a future change must:
+
+1. Add one trusted constructor at the live decision boundary which snapshots
+   the exact current `Decision`, full surface, ordered policy candidates,
+   real construction continuation (when present), complete session context,
+   and authoritative state atomically; no caller-supplied partial fragments.
+2. Make namespace values derive from verified build/content/schema constants
+   and reject cross-namespace comparison rather than trusting free-form
+   caller labels.
+3. Establish reflexive exact-equality behavior for every key component
+   (including the `PartialEq`-only Decision/action representations), with
+   property tests for each nested variant and every ordered vector.
+4. Differentially compare decisions, legal candidate order, observations,
+   terminal classification, successors and future RNG streams across
+   proposed reusable pairs. Structural equality is the candidate merge rule;
+   this semantic oracle remains necessary to justify any normalization.
+5. Keep this privileged key out of actor-visible information. Its GameState
+   and whole-session members contain hidden libraries/hands and RNG; neither
+   the key nor a digest derived from it may enter an observation, policy
+   candidate, or policy-facing information-set identity.
+
+No fields have been normalized or excluded, and this PR does not connect the
+contract to MADS scheduling, an engine transposition table, or policy
+observations.
+
+## 12. MADS-02D-C live-boundary audit and fail-closed preflight
+
+Audit commit: `adce843a2d27cb8490fec408e8b77cead2335067` (main, including the
+MADS-02D-B merge PR #8).
+
+### Where decisions are produced
+
+`engine::advance_until_decision(&mut GameState) -> Decision` is the rules
+engine boundary. It is a mutating walk: it validates state, drains pending
+work, advances steps, resolves stacks, and may write `engine.halted` before it
+returns. `PolicySurfaceV5::next_decision` calls that engine function and then
+applies its own mutating suppression/combat-scan protocol. `next_decision_owned`
+also installs an environment-revision binding. Therefore neither function is
+a read-only operation that an arbitrary key builder may call to check a
+caller-supplied Decision.
+
+`RlEpisodeSessionV1::advance_to_decision_or_terminal_profiled` owns one
+exclusive session transition. In that method it obtains `PolicyDecisionV5`,
+checks caps/actor, builds `ObservationV5`, builds the ordered V5 candidates,
+and stores `CurrentDecisionV1`. However, `CurrentDecisionV1` retains actor,
+observation, candidates, and revision/counter bindings, **not the exact
+PolicyDecisionV5 that produced them**. Reconstructing it later would require
+another mutating surface/engine advance. Its boundary is consequently
+insufficient for a trusted full decision key as presently stored.
+
+`FastActorSessionV1::advance_to_decision_or_terminal` performs the analogous
+exclusive transition and stores the exact `PolicyDecisionV5` as
+`FastActorCurrentDecisionV1::origin_decision`, alongside ordered core
+candidates and the revision/counter bindings. The session owns its
+`GameState` and `PolicySurfaceV5`; those fields cannot be independently
+replaced through the public API. This is the closest available capture point.
+It is still not a complete raw-engine capture for every context: attacker and
+blocker inclusion subdecisions are policy-only decisions, and core candidate
+records do not themselves store the full `PolicyActionV5` vector required by
+the existing envelope. Any adapter must reject those unsupported forms and
+recompute/reconcile the ordered full candidates from the saved origin and
+owned state without advancing the engine.
+
+### Components and timing
+
+| Component | Available at the owned FastActor boundary | Limit |
+|---|---|---|
+| Full `GameState`, including EngineState and RNG cursor | Yes, private owned field | Privileged state; never expose to policy/observation. |
+| Exact surfaced `PolicyDecisionV5` | Yes, `origin_decision` | May be policy-only (`AttackerInclusion`/`BlockerInclusion`) with no single raw `engine::Decision`. |
+| Exact raw `Decision` | Only for `PolicyDecisionV5::Surface(SurfaceDecision::Decision(d))` | Other surface subdecisions must fail closed. |
+| Full policy surface and construction scan state | Yes, clone of private `PolicySurfaceV5` | Includes combat scan, selected prefix, cursor, bindings and H2 surface. |
+| Ordered full `PolicyActionV5` candidates | Recomputable from saved origin decision plus state | Must be reconciled exactly with the saved core candidate semantics/order; any mismatch/incomplete vector rejects capture. |
+| Session/revision binding | Yes, full session clone and current revision/counters | Require current bindings to equal session-owned revision/counters before capture. |
+| Engine/content namespace | Build constants exist for commit, clean bit, tracked source tree SHA-256 and generated card DB hash | A dirty build must reject capture. No separately versioned rules or raw Decision schema contract exists; use complete authenticated tracked-tree identity as the rules/decision implementation binding, and retain the explicit schema versions that do exist. |
+
+The key must be captured only from an owned FastActor session method while its
+current record is bound to the same session revision. No API accepting
+independently assembled state/decision/candidates can certify a live key.
+
+### Namespace identity audit
+
+`build.rs` emits `MTG_KERNEL_BUILD_GIT_HEAD`, `MTG_KERNEL_BUILD_GIT_TREE`,
+`MTG_KERNEL_BUILD_GIT_CLEAN`, `MTG_KERNEL_BUILD_TRACKED_TREE_SHA256`, and its
+framing contract. These are build-derived values, unlike caller strings. The
+generated `card_def::KERNEL_CARDDB_HASH` binds the compiled card database.
+Existing schema/version values include `POLICY_SURFACE_VERSION`, RL
+observation/action schema versions, RL session schema/protocol versions,
+`ENVIRONMENT_RANDOMIZATION_IDENTITY_V2`, the frozen legacy state/hash
+contract, and the reserved key schema. There is no explicit raw `Decision`
+schema version, independently versioned rules contract, or live Dynamic MADS
+scheduler contract in this baseline. The authenticated complete source-tree
+digest can bind implementation changes for this build, but it does not
+magically prove semantic equivalence across versions. The MADS scheduler
+namespace must remain unavailable until a real engine scheduler contract is
+checked in.
+
+### Equality and proof gate before code changes
+
+`GameState` and `PolicySurfaceV5` implement `Eq`. `Decision`,
+`PolicyDecisionV5`, `PolicyActionV5`, full session objects, and the existing
+key envelope implement `PartialEq` only. Their current stored fields contain
+no known floating-point members in the live Decision/action path, but the
+trait surface does not guarantee reflexivity for every possible value, and
+the prior test covers a representative fixture rather than every variant.
+The exact equality contract remains structural comparison, with no
+`Eq`/`Hash` claim added here.
+
+Phase-1 conclusion: a complete state/decision/session point exists privately
+inside FastActor session ownership, but the persisted current record does not
+cover every engine decision shape or full candidates. Namespace authentication
+is possible only for clean builds and only for identities that exist. Any
+implementation must be an opaque, read-only, FastActor-owned capture that
+rejects policy-only contexts, candidate mismatches, stale revisions, and
+missing namespace components.
+
+MADS-02D-C adds the versioned, crate-private
+`FastActorSessionV1::trusted_live_key_capture_preflight_v1` contract. It takes
+only an owned FastActor session, checks that the current decision revision and
+counters still match the session, accepts only a surfaced raw engine Decision,
+and rebuilds the core legal candidate list from the saved decision and owned
+state to reject candidate omission/reordering. It never calls engine advance
+or step. If these checks pass, it checks build-derived identity inputs. The
+function currently returns a rejection: the available MADS scheduler
+identities (`FRONTIER_POLICY_V1`/`ACTION_ADMISSION_V1`) describe only the
+isolated fixture reference implementation, not a production live engine
+scheduler. It therefore produces **no key** and cannot authorize reuse.
+
+### Gate and targeted-test status
+
+| Requirement | Status after MADS-02D-C |
+|---|---|
+| T1 exact copy structural equality | PASS for existing owned-envelope fixture and actual session equality tests; `PartialEq` only where noted below. |
+| T2 different Decision recognized | PASS for structural envelope comparison; not an engine-state provenance proof. |
+| T3 candidate reordering recognized | PASS for ordered vector comparison. |
+| T4 policy scan position recognized | PASS for full surface structural comparison. |
+| T5 construction continuation recognized | PASS for generic structural comparison; actual continuation completeness remains tied to the entire owned surface/session clone. |
+| T6 session revision recognized | PASS for structural session equality and preflight stale-binding rejection. |
+| T7 namespace difference recognized | PASS for namespace structural comparison; live namespace still caller supplied in the generic contract. |
+| T8 foreign Decision rejected as live key | **NOT PROVEN**. The preflight does not accept an external Decision, but there is no pure engine validator proving the stored Decision is the unique current engine Decision for that state. Revision and private session ownership establish provenance only for supported session transitions. |
+| T9 incomplete candidates rejected | PASS for mutation/truncation of FastActor's saved core candidate vector; preflight recomputes and compares exact order. Completeness of the candidate generator against every engine action remains a separate proof obligation. |
+| T10 unsupported contexts rejected | PASS for policy-only attacker/blocker scan contexts, terminals, and absent current session decisions. |
+| Namespace authenticates engine/rules/card/schema/RNG/scheduler | **PARTIALLY PROVEN**. Build commit/tree/clean and generated card DB hash are authenticated inputs; no production Dynamic MADS scheduler contract exists. Raw Decision/rules have no independent version const, though the authenticated complete source tree binds their implementation. |
+
+The namespace gate rejects dirty builds before considering capture. A clean
+build still rejects due to the missing scheduler contract. No success-shaped
+placeholder identity or caller-provided namespace is accepted by this gate.
+The generic `DecisionStateKeyContractV1` remains a public equality contract,
+not a trusted live key; its caller-supplied fields remain unsuitable for TT
+admission.
+
+### Hidden-information and scheduler integration firewall
+
+`trusted_live_key_capture_preflight_v1` returns no state, candidate, hash, or
+digest. A future privileged captured key must remain crate-private and must
+never be projected into `ObservationV5`, `InformationSetKey`, policy features,
+replay labels, or teacher labels. It necessarily contains full library/hand
+contents and future RNG state. This PR adds no such projection and no TT use.
+
+Agent A's DynamicEngineSearchV1 contract is not imported. Integration requires
+that scheduler to call an owned-session capture only at a supported live
+decision boundary, compare full keys structurally after any bucket lookup,
+and treat every capture rejection as a cache miss/fail-closed condition. It
+must not call `advance_until_decision` to repair or validate a key, because
+that call mutates the game state.
+
+### Final gate decision
+
+**PARTIALLY_PROVEN capture preflight; trusted live key NOT PROVEN; TT reuse
+CLOSED.** T8 remains an explicit open obligation. Candidate reconstruction
+checks saved-candidate integrity, not universal engine action completeness.
+`Decision`, `PolicyDecisionV5`, `PolicyActionV5`, and session types expose
+`PartialEq`, not `Eq`; representative self-copy comparisons pass, but the
+trait/API does not establish reflexive exact identity for every possible
+value/variant. No `Eq` or `Hash` implementation was added to them or to the
+key envelope.

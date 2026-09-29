@@ -542,6 +542,73 @@ impl fmt::Display for FixtureNodeId {
     }
 }
 
+/// Shared synthetic control graph used by the independent oracle and MADS
+/// differential tests. This graph is not an engine-derived Magic position.
+#[cfg(test)]
+pub(crate) fn adversarial_control_fixture_v1() -> OracleFixtureV1 {
+    let edge = |order, stable_id: &str, child| FixtureEdgeV1 {
+        stable_id: stable_id.to_owned(),
+        order,
+        child: FixtureNodeId(child),
+        estimated_cost_bucket: 0,
+    };
+    OracleFixtureV1 {
+        fixture_id: "mads02f-synthetic-adversarial-control-v1".to_owned(),
+        root: FixtureNodeId(0),
+        root_player: FixturePlayerV1::P0,
+        nodes: vec![
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(0),
+                actor: FixturePlayerV1::P0,
+                actions: vec![
+                    edge(0, "safe-a", 1),
+                    edge(1, "safe-b", 2),
+                    edge(2, "risky", 3),
+                ],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(1),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "allow-win", 4), edge(1, "force-draw", 5)],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(2),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "allow-win-too", 6), edge(1, "force-draw-too", 7)],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(3),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "punish", 8), edge(1, "spare", 9)],
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(4),
+                outcome: FixtureOutcomeV1::Win,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(5),
+                outcome: FixtureOutcomeV1::Draw,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(6),
+                outcome: FixtureOutcomeV1::Win,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(7),
+                outcome: FixtureOutcomeV1::Draw,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(8),
+                outcome: FixtureOutcomeV1::Loss,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(9),
+                outcome: FixtureOutcomeV1::Draw,
+            },
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,5 +804,40 @@ mod tests {
             too_deep.solve_oracle_v1(),
             Err(OracleErrorV1::FixtureTooLarge)
         );
+    }
+
+    /// Synthetic control graph for adversarial search checks. Every leaf is
+    /// intentionally mixed so this graph exercises values unavailable from the
+    /// MADS-02B all-win, forced-Pass engine position.
+    #[test]
+    fn adversarial_control_fixture_has_mixed_values_ties_and_max_min_switches() {
+        let f = adversarial_control_fixture_v1();
+        let result = f.solve_oracle_v1().unwrap();
+        assert_eq!(result.root_value, 0);
+        assert_eq!(result.optimal_root_actions, ["safe-a", "safe-b"]);
+        assert_eq!(
+            result.complete_legal_root_actions,
+            ["safe-a", "safe-b", "risky"]
+        );
+        assert_eq!(
+            (
+                result.unique_game_nodes,
+                result.terminal_nodes,
+                result.total_edges
+            ),
+            (4, 6, 9)
+        );
+        assert_eq!(
+            (
+                result.terminal_classification.loss,
+                result.terminal_classification.draw,
+                result.terminal_classification.win
+            ),
+            (1, 3, 2)
+        );
+        assert_eq!(result.node_values[&FixtureNodeId(0)], 0);
+        assert_eq!(result.node_values[&FixtureNodeId(1)], 0);
+        assert_eq!(result.node_values[&FixtureNodeId(3)], -1);
+        assert_eq!(result.authoritative_transitions, 0);
     }
 }
