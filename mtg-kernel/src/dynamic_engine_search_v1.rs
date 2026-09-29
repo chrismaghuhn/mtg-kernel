@@ -4,7 +4,10 @@
 //! Only complete, explicitly enumerated decision domains are admitted.
 use crate::engine::{self, Action, Decision};
 use crate::ids::PlayerId;
-use crate::mads_v1::{backup_bounds_v1, critical_support_v1, BoundIntervalV1, MadsRoleV1, WIN_V1};
+use crate::mads_v1::{
+    backup_bounds_v1, critical_support_v1, frontier_sort_key_v1, BoundIntervalV1,
+    ExpansionRoleMaskV1, ExpansionSemanticOrderV1, MadsRoleV1, WIN_V1,
+};
 use crate::state::GameState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,11 +30,24 @@ impl DynamicSearchStatusV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicSearchErrorV1 {
     UnsupportedDecision,
+    InvalidDecisionFrame,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl std::fmt::Display for DynamicSearchErrorV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedDecision => f.write_str("UNSUPPORTED_DECISION"),
+            Self::InvalidDecisionFrame => f.write_str("INVALID_ENGINE_DECISION_FRAME"),
+        }
+    }
+}
+
+impl std::error::Error for DynamicSearchErrorV1 {}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DynamicRootActionV1 {
     pub stable_id: String,
+    pub engine_action: Action,
     pub bounds: BoundIntervalV1,
     pub expanded: bool,
 }
@@ -47,10 +63,11 @@ pub struct DynamicSearchMetricsV1 {
     pub root_certified: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DynamicSearchResultV1 {
     pub status: DynamicSearchStatusV1,
     pub chosen_action: Option<String>,
+    pub chosen_engine_action: Option<Action>,
     pub certified_optimal_actions: Vec<String>,
     pub exact_root_value: Option<i8>,
     pub anytime_action: Option<String>,
@@ -74,6 +91,34 @@ struct Node {
     parent: Option<usize>,
     bounds: BoundIntervalV1,
     terminal: bool,
+    semantic_path: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct DynamicExpansionTask {
+    owner: usize,
+    slot: usize,
+    role_mask: u8,
+    root_action_support: Vec<usize>,
+    bound_width: u8,
+    min_root_distance: u16,
+    estimated_cost_bucket: u16,
+    owner_semantic_path: Vec<u32>,
+}
+
+impl DynamicExpansionTask {
+    fn sort_key(&self) -> crate::mads_v1::FrontierSortKeyV1 {
+        frontier_sort_key_v1(
+            self.role_mask,
+            self.bound_width,
+            self.min_root_distance,
+            self.estimated_cost_bucket,
+            self.owner_semantic_path.clone(),
+            ExpansionSemanticOrderV1::GameAction {
+                action_order: self.slot as u32,
+            },
+        )
+    }
 }
 
 /// Owns independent state clones. `root_state` is borrowed only for the
@@ -100,12 +145,56 @@ impl DynamicEngineSearchV1 {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn debug_next_task_v1(
+        &self,
+    ) -> Option<(
+        GameState,
+        Decision,
+        String,
+        u8,
+        u8,
+        u16,
+        u16,
+        Vec<u32>,
+        Vec<usize>,
+    )> {
+        let task = self
+            .build_frontier_v1()
+            .into_values()
+            .min_by_key(DynamicExpansionTask::sort_key)?;
+        Some((
+            self.nodes[task.owner].state.clone(),
+            self.nodes[task.owner].decision.clone(),
+            self.nodes[task.owner].slots[task.slot].id.clone(),
+            task.role_mask,
+            task.bound_width,
+            task.min_root_distance,
+            task.estimated_cost_bucket,
+            task.owner_semantic_path,
+            task.root_action_support,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_result_with_status_v1(
+        &self,
+        status: DynamicSearchStatusV1,
+    ) -> DynamicSearchResultV1 {
+        self.result(status)
+    }
+
     pub fn new(
         root_state: &GameState,
         root_decision: Decision,
     ) -> Result<Self, DynamicSearchErrorV1> {
         let root_player = actor(&root_decision).ok_or(DynamicSearchErrorV1::UnsupportedDecision)?;
-        let root = admit(root_state.clone(), root_decision, root_player, None, 0, &[])
+        let mut root_binding = root_state.clone();
+        let authoritative_decision = engine::advance_until_decision(&mut root_binding);
+        if root_binding != *root_state || authoritative_decision != root_decision {
+            return Err(DynamicSearchErrorV1::InvalidDecisionFrame);
+        }
+        let root = admit(root_binding, root_decision, root_player, None, 0, &[])
             .map_err(|_| DynamicSearchErrorV1::UnsupportedDecision)?;
         let admitted = root.slots.len() as u64;
         Ok(Self {
@@ -156,6 +245,9 @@ impl DynamicEngineSearchV1 {
                 }
                 Err(_) => return self.result(DynamicSearchStatusV1::UnsupportedDecision),
             };
+            let mut child = child;
+            child.semantic_path = self.nodes[n].semantic_path.clone();
+            child.semantic_path.push(a as u32);
             self.metrics.admitted_actions += child.slots.len() as u64;
             let index = self.nodes.len();
             self.nodes.push(child);
@@ -172,8 +264,17 @@ impl DynamicEngineSearchV1 {
     }
 
     fn next_task(&self) -> Option<(usize, usize)> {
-        // Root-critical order: incumbent lower support first, then challenger
-        // upper support; deterministic node/action order breaks ties.
+        self.build_frontier_v1()
+            .into_values()
+            .min_by_key(DynamicExpansionTask::sort_key)
+            .map(|task| (task.owner, task.slot))
+    }
+
+    fn build_frontier_v1(
+        &self,
+    ) -> std::collections::BTreeMap<(usize, usize), DynamicExpansionTask> {
+        // Reference frontier rebuild: collect every critical support task,
+        // merge role masks/root support, then use MADS-01's exact sort key.
         let slots = &self.nodes[self.root].slots;
         let bounds = slots
             .iter()
@@ -182,48 +283,117 @@ impl DynamicEngineSearchV1 {
                     .map_or(BoundIntervalV1::UNKNOWN, |c| self.nodes[c].bounds)
             })
             .collect::<Vec<_>>();
-        let incumbent =
-            (0..slots.len()).max_by_key(|&i| (bounds[i].lower, std::cmp::Reverse(i)))?;
+        let Some(incumbent) =
+            (0..slots.len()).max_by_key(|&i| (bounds[i].lower, std::cmp::Reverse(i)))
+        else {
+            return std::collections::BTreeMap::new();
+        };
         let challenger = (0..slots.len())
             .filter(|&i| i != incumbent)
             .max_by_key(|&i| (bounds[i].upper, std::cmp::Reverse(i)));
+        let mut tasks = std::collections::BTreeMap::<(usize, usize), DynamicExpansionTask>::new();
         for (root_action, is_incumbent) in [(Some(incumbent), true), (challenger, false)] {
             let Some(root_action) = root_action else {
                 continue;
             };
             if self.nodes[self.root].slots[root_action].child.is_none() {
-                return Some((self.root, root_action));
+                self.insert_dynamic_task(
+                    &mut tasks,
+                    self.root,
+                    root_action,
+                    is_incumbent,
+                    root_action,
+                    0,
+                );
+                continue;
             }
-            let mut stack = vec![self.nodes[self.root].slots[root_action].child?];
-            while let Some(n) = stack.pop() {
-                let node = &self.nodes[n];
-                if let Some(role) = node.role {
-                    if let Some(a) = node.slots.iter().position(|s| {
-                        s.child.is_none()
-                            && critical_support_v1(role, is_incumbent, node.bounds, None)
-                    }) {
-                        return Some((n, a));
-                    }
-                    for c in node
-                        .slots
-                        .iter()
-                        .rev()
-                        .filter_map(|s| s.child)
-                        .filter(|&c| {
-                            critical_support_v1(
-                                role,
-                                is_incumbent,
-                                node.bounds,
-                                Some(self.nodes[c].bounds),
-                            )
-                        })
-                    {
-                        stack.push(c);
-                    }
+            let Some(child) = self.nodes[self.root].slots[root_action].child else {
+                continue;
+            };
+            self.collect_dynamic_support(
+                child,
+                is_incumbent,
+                root_action,
+                1,
+                &mut std::collections::BTreeSet::new(),
+                &mut tasks,
+            );
+        }
+        tasks
+    }
+
+    fn collect_dynamic_support(
+        &self,
+        node_index: usize,
+        incumbent: bool,
+        root_action: usize,
+        distance: u16,
+        visited: &mut std::collections::BTreeSet<(usize, bool)>,
+        tasks: &mut std::collections::BTreeMap<(usize, usize), DynamicExpansionTask>,
+    ) {
+        if !visited.insert((node_index, incumbent)) {
+            return;
+        }
+        let node = &self.nodes[node_index];
+        let Some(role) = node.role else { return };
+        for (slot_index, slot) in node.slots.iter().enumerate() {
+            if let Some(child) = slot.child {
+                if critical_support_v1(role, incumbent, node.bounds, Some(self.nodes[child].bounds))
+                {
+                    self.collect_dynamic_support(
+                        child,
+                        incumbent,
+                        root_action,
+                        distance + 1,
+                        visited,
+                        tasks,
+                    );
                 }
+            } else if critical_support_v1(role, incumbent, node.bounds, None) {
+                self.insert_dynamic_task(
+                    tasks,
+                    node_index,
+                    slot_index,
+                    incumbent,
+                    root_action,
+                    distance,
+                );
             }
         }
-        None
+    }
+
+    fn insert_dynamic_task(
+        &self,
+        tasks: &mut std::collections::BTreeMap<(usize, usize), DynamicExpansionTask>,
+        owner: usize,
+        slot: usize,
+        incumbent: bool,
+        root_action: usize,
+        distance: u16,
+    ) {
+        let node = &self.nodes[owner];
+        let entry = tasks
+            .entry((owner, slot))
+            .or_insert_with(|| DynamicExpansionTask {
+                owner,
+                slot,
+                role_mask: 0,
+                root_action_support: Vec::new(),
+                bound_width: node.bounds.width(),
+                min_root_distance: distance,
+                estimated_cost_bucket: 1,
+                owner_semantic_path: node.semantic_path.clone(),
+            });
+        entry.role_mask |= if incumbent {
+            ExpansionRoleMaskV1::INCUMBENT_LOWER
+        } else {
+            ExpansionRoleMaskV1::CHALLENGER_UPPER
+        };
+        entry.min_root_distance = entry.min_root_distance.min(distance);
+        if !entry.root_action_support.contains(&root_action) {
+            entry.root_action_support.push(root_action);
+            entry.root_action_support.sort_unstable();
+        }
     }
 
     fn recompute(&mut self) {
@@ -274,6 +444,7 @@ impl DynamicEngineSearchV1 {
             .iter()
             .map(|s| DynamicRootActionV1 {
                 stable_id: s.id.clone(),
+                engine_action: s.action.clone(),
                 bounds: s
                     .child
                     .map_or(BoundIntervalV1::UNKNOWN, |c| self.nodes[c].bounds),
@@ -281,9 +452,12 @@ impl DynamicEngineSearchV1 {
             })
             .collect::<Vec<_>>();
         let cert = self.certified();
-        let chosen = (status == DynamicSearchStatusV1::Certified)
-            .then(|| cert.first().cloned())
-            .flatten();
+        let chosen = cert.first().cloned();
+        let chosen_engine_action = root
+            .slots
+            .iter()
+            .find(|slot| Some(&slot.id) == chosen.as_ref())
+            .map(|slot| slot.action.clone());
         let root_bounds = root.bounds;
         let anytime = actions
             .iter()
@@ -295,6 +469,7 @@ impl DynamicEngineSearchV1 {
             status,
             exact_root_value: (root_bounds.lower == root_bounds.upper).then_some(root_bounds.lower),
             chosen_action: chosen,
+            chosen_engine_action,
             certified_optimal_actions: cert,
             anytime_action: anytime,
             root_bounds,
@@ -380,6 +555,7 @@ fn admit(
         parent,
         bounds,
         terminal: terminal.is_some(),
+        semantic_path: Vec::new(),
     })
 }
 fn complete_cast_domain(d: &Decision, s: &GameState) -> Result<Vec<(String, Action)>, String> {
@@ -422,12 +598,30 @@ fn complete_cast_domain(d: &Decision, s: &GameState) -> Result<Vec<(String, Acti
                     } else {
                         Action::ActivateManaAbilityChoice(*source, choice)
                     };
-                a.push((format!("Mana:{}:{}", source.0, color_id(choice)), action));
+                let id = match &action {
+                    Action::ActivateManaAbility(source) => {
+                        format!("ActivateManaAbility:{}", source.0)
+                    }
+                    Action::ActivateManaAbilityChoice(source, color) => format!(
+                        "ActivateManaAbilityChoice:{}:{}",
+                        source.0,
+                        color_id(*color)
+                    ),
+                    _ => unreachable!(),
+                };
+                a.push((id, action));
             } else {
                 for target in &targets {
+                    let action =
+                        Action::ActivateManaAbilityWithCostTarget(*source, choice, *target);
                     a.push((
-                        format!("ManaCost:{}:{}:{}", source.0, color_id(choice), target.0),
-                        Action::ActivateManaAbilityWithCostTarget(*source, choice, *target),
+                        format!(
+                            "ActivateManaAbilityWithCostTarget:{}:{}:{}",
+                            source.0,
+                            color_id(choice),
+                            target.0
+                        ),
+                        action,
                     ));
                 }
             }

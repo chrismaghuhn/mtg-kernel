@@ -71,6 +71,44 @@ pub(crate) fn critical_support_v1(
     }
 }
 
+pub(crate) type FrontierSortKeyV1 = (
+    u8,
+    std::cmp::Reverse<u8>,
+    u16,
+    u16,
+    Vec<u32>,
+    ExpansionSemanticOrderV1,
+);
+
+pub(crate) fn frontier_sort_key_v1(
+    role_mask: u8,
+    bound_width: u8,
+    min_root_distance: u16,
+    estimated_cost_bucket: u16,
+    owner_semantic_path: Vec<u32>,
+    semantic_order: ExpansionSemanticOrderV1,
+) -> FrontierSortKeyV1 {
+    let both = role_mask & ExpansionRoleMaskV1::INCUMBENT_LOWER != 0
+        && role_mask & ExpansionRoleMaskV1::CHALLENGER_UPPER != 0;
+    let role_rank = if both {
+        0
+    } else if role_mask & ExpansionRoleMaskV1::INCUMBENT_LOWER != 0 {
+        1
+    } else if role_mask & ExpansionRoleMaskV1::CHALLENGER_UPPER != 0 {
+        2
+    } else {
+        3
+    };
+    (
+        role_rank,
+        std::cmp::Reverse(bound_width),
+        min_root_distance,
+        estimated_cost_bucket,
+        owner_semantic_path,
+        semantic_order,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MadsRoleV1 {
     Max,
@@ -283,11 +321,12 @@ pub struct ExpansionTaskV1 {
     pub bound_width: u8,
     pub min_root_distance: u16,
     pub estimated_cost_bucket: u16,
+    pub owner_semantic_path: Vec<u32>,
     construction_key_or_action_order: ExpansionSemanticOrderV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum ExpansionSemanticOrderV1 {
+pub(crate) enum ExpansionSemanticOrderV1 {
     GameAction {
         action_order: u32,
     },
@@ -300,40 +339,13 @@ enum ExpansionSemanticOrderV1 {
 }
 
 impl ExpansionTaskV1 {
-    fn role_rank(&self) -> u8 {
-        if self.role_mask.supports_both_primary() {
-            0
-        } else if self
-            .role_mask
-            .contains(ExpansionRoleMaskV1::INCUMBENT_LOWER)
-        {
-            1
-        } else if self
-            .role_mask
-            .contains(ExpansionRoleMaskV1::CHALLENGER_UPPER)
-        {
-            2
-        } else {
-            3
-        }
-    }
-
-    fn scheduler_key(
-        &self,
-    ) -> (
-        u8,
-        std::cmp::Reverse<u8>,
-        u16,
-        u16,
-        FixtureNodeId,
-        ExpansionSemanticOrderV1,
-    ) {
-        (
-            self.role_rank(),
-            std::cmp::Reverse(self.bound_width),
+    fn scheduler_key(&self) -> FrontierSortKeyV1 {
+        frontier_sort_key_v1(
+            self.role_mask.0,
+            self.bound_width,
             self.min_root_distance,
             self.estimated_cost_bucket,
-            self.owner,
+            self.owner_semantic_path.clone(),
             self.construction_key_or_action_order.clone(),
         )
     }
@@ -407,6 +419,32 @@ pub struct MadsGraphV1<'a> {
     metrics: SearchMetricsV1,
     frontier: Vec<ExpansionTaskV1>,
     heuristic_by_fixture_id: BTreeMap<FixtureNodeId, f64>,
+    semantic_path_by_fixture_id: BTreeMap<FixtureNodeId, Vec<u32>>,
+}
+
+fn fixture_semantic_paths_v1(fixture: &OracleFixtureV1) -> BTreeMap<FixtureNodeId, Vec<u32>> {
+    let nodes = fixture
+        .nodes
+        .iter()
+        .map(|node| (node.id(), node))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = BTreeMap::from([(fixture.root, Vec::new())]);
+    let mut stack = vec![fixture.root];
+    while let Some(owner) = stack.pop() {
+        let Some(node) = nodes.get(&owner) else {
+            continue;
+        };
+        let owner_path = paths.get(&owner).cloned().unwrap_or_default();
+        for edge in node.edges().iter().rev() {
+            if let std::collections::btree_map::Entry::Vacant(entry) = paths.entry(edge.child) {
+                let mut child_path = owner_path.clone();
+                child_path.push(edge.order);
+                entry.insert(child_path);
+                stack.push(edge.child);
+            }
+        }
+    }
+    paths
 }
 
 impl<'a> MadsGraphV1<'a> {
@@ -418,6 +456,7 @@ impl<'a> MadsGraphV1<'a> {
             .iter()
             .map(|node| (node.id(), node))
             .collect::<BTreeMap<_, _>>();
+        let semantic_path_by_fixture_id = fixture_semantic_paths_v1(fixture);
         let Some(root_node) = fixture_nodes.get(&fixture.root).copied() else {
             return Err(MadsErrorV1::InvalidRoot(
                 "fixture root is absent".to_owned(),
@@ -451,6 +490,7 @@ impl<'a> MadsGraphV1<'a> {
             },
             frontier: Vec::new(),
             heuristic_by_fixture_id: BTreeMap::new(),
+            semantic_path_by_fixture_id,
         })
     }
 
@@ -797,6 +837,11 @@ impl<'a> MadsGraphV1<'a> {
                 min_root_distance: distance,
                 estimated_cost_bucket: slot.cost_bucket,
                 construction_key_or_action_order,
+                owner_semantic_path: self
+                    .semantic_path_by_fixture_id
+                    .get(&owner)
+                    .cloned()
+                    .unwrap_or_default(),
             });
         match role {
             CriticalRoleV1::IncumbentLower => {
