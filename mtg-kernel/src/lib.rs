@@ -83,6 +83,9 @@ pub mod ids;
 pub mod kernel_native_search_calibration_runner_v1;
 pub mod kernel_native_search_opponent_v1;
 pub mod mana;
+// MADS-01 interval graph over isolated OracleSuiteV1 decision fixtures. This
+// module is not a live-Magic searcher and does not enable an engine TT.
+pub mod mads_v1;
 // Model-guided searcher authority record SCHEMA ONLY (design item 4,
 // `CLAUDE-MODEL-GUIDED-SEARCHER-DESIGN-V1.md` Section 1.4 / 5.3). No
 // dispatch, no science-loop or scorer-bridge wiring; that is item 6, its own
@@ -395,6 +398,9 @@ pub mod native_training_store_v2;
 // default, never built into the product binary.
 pub mod phase_profile;
 pub mod policy_surface_v5;
+// Independent bounded minimax oracle for deterministic fixture DAGs; it does
+// not invoke or certify the authoritative MTG rules engine.
+pub mod oracle_suite_v1;
 pub(crate) mod private_physical_trajectory_core;
 pub(crate) mod private_physical_trajectory_v1;
 pub(crate) mod private_physical_trajectory_v2;
