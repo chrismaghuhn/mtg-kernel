@@ -88,6 +88,9 @@ pub mod mana;
 #[cfg(test)]
 mod mads02b_engine_probe_v1;
 pub mod mads_v1;
+// Versioned structural-identity contract for a future real-engine MADS key.
+// This is deliberately not connected to the dynamic scheduler or any TT.
+pub mod mads_decision_state_key_v1;
 // Model-guided searcher authority record SCHEMA ONLY (design item 4,
 // `CLAUDE-MODEL-GUIDED-SEARCHER-DESIGN-V1.md` Section 1.4 / 5.3). No
 // dispatch, no science-loop or scorer-bridge wiring; that is item 6, its own

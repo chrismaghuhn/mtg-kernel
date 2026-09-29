@@ -538,7 +538,7 @@ impl From<RlSessionError> for RlContractError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct CurrentDecisionV1 {
     actor: PlayerId,
     physical_decision_id: u64,
@@ -3856,7 +3856,7 @@ enum FastActorApplyPathV1 {
     CloneReference,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct RlEpisodeSessionV1 {
     deck_ids: SessionDeckIdsV1,
     deck_hashes: SessionDeckHashesV1,
@@ -3884,7 +3884,7 @@ enum FlatActionContractModeV1 {
 /// In-process actor lane that preserves the v5 policy surface and transition
 /// semantics while omitting observations, visible hashes, stable/display
 /// strings, and all JSON/Python work.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct FastActorSessionV1 {
     deck_ids: SessionDeckIdsV1,
     deck_hashes: SessionDeckHashesV1,
@@ -7114,6 +7114,71 @@ mod tests {
     };
     use crate::state::{Counters, GameObject, GameState, ObjectStateV4, SplitMix64, Step, Zone};
     use std::collections::HashSet;
+
+    #[test]
+    fn rl_session_structural_identity_includes_owned_context() {
+        let base = RlEpisodeSessionV1::reset(41, 99, 8);
+        let identical = base.clone();
+        let mut revised = base.clone();
+        revised.environment_revision = revised.environment_revision.saturating_add(1);
+
+        assert!(base == identical);
+        assert!(base != revised);
+    }
+
+    #[test]
+    fn fast_actor_session_structural_identity_includes_action_contract_mode() {
+        let base = FastActorSessionV1::reset(41, 99, 8);
+        let identical = base.clone();
+        let mut v2 = base.clone();
+        v2.flat_action_contract_mode = FlatActionContractModeV1::V2;
+
+        assert!(base == identical);
+        assert!(base != v2);
+    }
+
+    #[test]
+    fn exact_key_contract_accepts_live_engine_surface_and_session_values() {
+        use crate::engine::Decision;
+        use crate::ids::ObjectId;
+        use crate::mads_decision_state_key_v1::{
+            DecisionStateKeyContractV1, DecisionStateNamespaceInputsV1, DecisionStateNamespaceV1,
+        };
+        use crate::policy_surface_v5::PolicyActionV5;
+
+        type Key = DecisionStateKeyContractV1<PolicySurfaceV5, String, RlEpisodeSessionV1>;
+        let session = RlEpisodeSessionV1::reset(41, 99, 8);
+        let make_key = |session: &RlEpisodeSessionV1| Key {
+            namespace: DecisionStateNamespaceV1::mads_v1(DecisionStateNamespaceInputsV1 {
+                engine_source_revision: "engine-revision-test".into(),
+                rules_contract: "rules-v1".into(),
+                card_database_identity: "card-db-test".into(),
+                card_database_hash: crate::card_def::KERNEL_CARDDB_HASH,
+                decision_schema_version: 1,
+                policy_surface_version: crate::policy_surface_v5::POLICY_SURFACE_VERSION,
+                randomization_contract: "legacy-splitmix64-v1".into(),
+                scheduler_contract: "dynamic-mads-v1".into(),
+            }),
+            game_state: session.state.clone(),
+            engine_decision: Decision::ChooseKicker {
+                player: PlayerId::P0,
+                spell: ObjectId(0),
+            },
+            policy_surface: session.surface.clone(),
+            ordered_policy_candidates: Vec::<PolicyActionV5>::new(),
+            construction: None,
+            session: session.clone(),
+        };
+
+        let first = make_key(&session);
+        let equal = make_key(&session.clone());
+        let mut next_revision = session.clone();
+        next_revision.environment_revision = next_revision.environment_revision.saturating_add(1);
+        let changed = make_key(&next_revision);
+
+        assert!(first.exactly_matches(&equal));
+        assert!(!first.exactly_matches(&changed));
+    }
 
     fn attacker_state(count: usize) -> GameState {
         let mut state = GameState::new_from_libraries(&[], &[], card_name, 91);

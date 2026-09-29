@@ -2,7 +2,7 @@
 
 **Status: NOT PROVEN. Real-engine transposition-table reuse is blocked.**
 
-Audit baseline: `main` at `4833d614cc6baca39c407a00eb3ffd30d0714f20` (MADS-02D).
+Audit baseline: `main` at `b0193a611aef394971da4a249c9f8367bb212c92` (MADS-02D-B; includes MADS-02D at `4ee2fbfc88ec06012f012aacda4e9640c4d041c9`).
 Rust 1.94.1. This audit does not import Manafold's identity contracts.
 
 ## 1. Identity questions are distinct
@@ -174,9 +174,9 @@ For every proposed equivalent pair, compare the full legal decision protocol, te
 | Item | Status |
 |---|---|
 | Full GameState and EngineState field inventory | AUDITED; all recursively included |
-| Decision/policy-surface/session context | AUDITED; exact identity required, not presently comparable as a single Eq key |
+| Decision/policy-surface/session context | AUDITED; surface and session values now compare structurally, but no trusted live-key adapter exists |
 | NORMALIZE / EXCLUDE field with proof | NONE |
-| Full exact bootstrap MTG key | NOT PROVEN / NOT IMPLEMENTED |
+| Full exact bootstrap MTG key | NOT PROVEN; a versioned structural contract exists, no trusted engine adapter |
 | Real-engine transposition table | BLOCKED |
 | Isolated OracleFixtureId identity | ALLOWED only within a self-contained fixture; fixture IDs are exact semantic identity by construction |
 | Fair perfect-information MTG search adapter | NOT IMPLEMENTED; hidden-information firewall applies |
@@ -251,3 +251,83 @@ actor-visible information-set key must be independently derived from that
 actor's authorized observation/knowledge projection and must not include
 opponent hidden object identities, unseen library order, or future RNG state.
 No such real-game adapter is implemented or proven at this commit.
+
+## 12. MADS-02D-B exact identity contract
+
+The successor implementation adds
+`mads_decision_state_key_v1::DecisionStateKeyContractV1`. Its structural
+comparison contains all of these components:
+
+| Component | Stored identity | Status |
+|---|---|---|
+| Engine namespace | source revision, rules contract, card database identity and hash, decision schema, policy surface version, randomization contract, scheduler contract, key schema | Included; caller-supplied and not independently authenticated |
+| Authoritative rules state | full `GameState`, including recursive `EngineState` and RNG | Structural `Eq`; included |
+| Current engine decision | complete `Decision` variant and all payload vectors/values | Structural `PartialEq`; included, order retained |
+| Policy surface | full `PolicySurfaceV5`, including H2 suppressions, counters, blocker reshape, scan/binding and debug flags | Structural `PartialEq + Eq` added; included |
+| Policy candidates | ordered `Vec<PolicyActionV5>` | Structural `PartialEq`; order retained |
+| Construction progress | caller-supplied `Option<Construction>` | Required key field, but no real-engine adapter/type yet |
+| Session | whole caller-supplied session snapshot | Structural `PartialEq` added to `RlEpisodeSessionV1` and `FastActorSessionV1`; includes counters, current record, observation/candidate/cache bindings and terminal state |
+
+The new `PartialEq` derives on `HarnessSurfaceV2`, `PolicySurfaceV5`,
+`CurrentDecisionV1`, and both session structs add comparison only. They do not
+alter serialization, action/observation schemas, or transition behavior.
+Derived comparison recursively visits every declared field, so new fields
+are included automatically. For session current decisions, candidate order,
+observation and revision bindings compare as stored. Fast actor caches and
+cached errors also compare exactly; this deliberately distinguishes cache
+representations until their irrelevance is proven.
+
+The key has no `Hash` implementation. `Decision` and action values currently
+offer structural `PartialEq`, not a marker `Eq`; any future table can use a
+hash only to select a bucket and must then call exact structural comparison.
+There is no hash-only reuse path in this module. Namespace construction
+records content/version labels but does not yet verify that source revision,
+rules, card data, schema, RNG, and scheduler arguments truthfully describe a
+running engine build.
+
+### Executable equality tests and limits
+
+Added tests cover: equal cloned key envelopes; negative envelope pairs for
+namespace, GameState/library order, engine Decision/actor, policy-surface
+cursor, ordered candidates, construction prefix, and session revision; an
+actual namespace mutation for each rules/content/schema/RNG/scheduler/key
+field; actual PolicySurface clones versus changed H2 suppression mode, scan
+cursor, and scan order; actual RL session clones versus a changed owned
+environment revision; and a FastActor session clone versus a changed flat
+action contract mode. The actual-session test also instantiates the contract
+with live `GameState`, `PolicySurfaceV5`, and `RlEpisodeSessionV1` values.
+
+These tests verify exact field comparison and conservative discrimination.
+They do not prove that all current decisions are semantically paired with
+their cached candidate vectors, that a construction snapshot is complete, or
+that distinct session identities could safely share a value. In particular,
+fixture snapshot types in the key module test generic equality mechanics;
+they are not engine adapters and do not certify future behavior.
+
+### Remaining release proof obligations
+
+**Status remains NOT PROVEN. Production TT reuse remains CLOSED.** Before
+reuse can be enabled, a future change must:
+
+1. Add one trusted constructor at the live decision boundary which snapshots
+   the exact current `Decision`, full surface, ordered policy candidates,
+   real construction continuation (when present), complete session context,
+   and authoritative state atomically; no caller-supplied partial fragments.
+2. Make namespace values derive from verified build/content/schema constants
+   and reject cross-namespace comparison rather than trusting free-form
+   caller labels.
+3. Establish reflexive exact-equality behavior for every key component
+   (including the `PartialEq`-only Decision/action representations), with
+   property tests for each nested variant and every ordered vector.
+4. Differentially compare decisions, legal candidate order, observations,
+   terminal classification, successors and future RNG streams across
+   proposed reusable pairs. Structural equality is the candidate merge rule;
+   this semantic oracle remains necessary to justify any normalization.
+5. Keep this privileged key out of actor-visible information. Its GameState
+   and whole-session members contain hidden libraries/hands and RNG; neither
+   the key nor a digest derived from it may enter an observation, policy
+   candidate, or policy-facing information-set identity.
+
+No fields have been normalized or excluded, and this PR does not connect the
+contract to MADS scheduling, an engine transposition table, or policy
+observations.
