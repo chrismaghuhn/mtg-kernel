@@ -87,6 +87,8 @@ pub mod mana;
 // module is not a live-Magic searcher and does not enable an engine TT.
 #[cfg(test)]
 mod mads02b_engine_probe_v1;
+#[cfg(test)]
+mod mads02e_structured_decision_audit_v1;
 pub mod mads_v1;
 // Model-guided searcher authority record SCHEMA ONLY (design item 4,
 // `CLAUDE-MODEL-GUIDED-SEARCHER-DESIGN-V1.md` Section 1.4 / 5.3). No

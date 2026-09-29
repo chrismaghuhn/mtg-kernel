@@ -1,0 +1,503 @@
+//! Test-only protocol probes for structured MADS decision construction.
+//!
+//! These fixtures audit real engine continuations. They do not implement
+//! ConstructionNodes, modify rules, or publish teacher labels.
+
+use crate::card_def::card_id_by_name;
+use crate::engine::{self, Action, CastMode, Decision};
+use crate::event::{self, ProposedEvent};
+use crate::ids::{ObjectId, PlayerId};
+use crate::policy_surface_v5::PolicyDecisionV5;
+use crate::rl::{self, card_name, legal_action_candidates_v5};
+use crate::runtime_decks::runtime_deck_by_id;
+use crate::state::{Counters, GameObject, GameState, ObjectStateV4, Step, Target, Zone};
+use crate::surface_v2::{HarnessSurfaceV2, SurfaceAction, SurfaceDecision};
+
+const CAST_CONTINUATION_SEED: u64 = 0x2;
+const APNAP_BATCH_SEED: u64 = 0x02e0_0001;
+const FIREBLAST_PROTOCOL_SEED: u64 = 0x02e0_0002;
+const RAW_V5_REJECTION_SEED: u64 = 0x02e0_0003;
+
+fn first_p0_main1(state: &mut GameState) -> Decision {
+    for _ in 0..32 {
+        let decision = engine::advance_until_decision(state);
+        match &decision {
+            Decision::CastSpellOrPass { player, .. }
+                if *player == PlayerId::P0 && state.step == Step::Main1 =>
+            {
+                return decision;
+            }
+            Decision::CastSpellOrPass { .. } => {
+                engine::step(state, Action::Pass).expect("priority pass before P0 Main1");
+            }
+            Decision::DeclareAttackers { eligible, .. } if eligible.is_empty() => {
+                engine::step(state, Action::DeclareAttackers(Vec::new()))
+                    .expect("empty attacker declaration during setup");
+            }
+            Decision::GameOver { .. } => panic!("fixture ended before P0 Main1"),
+            Decision::Halted { .. } => panic!("fixture reached Halted before P0 Main1"),
+            other => panic!("unsupported setup protocol before P0 Main1: {other:?}"),
+        }
+    }
+    panic!("P0 Main1 not reached within 32 engine decisions")
+}
+
+fn burn_start_with_mountain_and_bolt() -> GameState {
+    let burn = runtime_deck_by_id("Burn").expect("official runtime Burn deck");
+    let mountain = card_id_by_name("Mountain").unwrap();
+    let bolt = card_id_by_name("Lightning Bolt").unwrap();
+    assert_eq!(burn.id, "Burn");
+    assert_eq!(burn.mainboard_count, 60);
+    assert!(burn.card_ids.contains(&mountain));
+    assert!(burn.card_ids.contains(&bolt));
+    assert_eq!(
+        burn.source_sha256,
+        "4ebba6b42bb27a0ea55001cee133aada81f0dffd8661b46b012fc5026675aa32"
+    );
+    assert_eq!(burn.runtime_deck_hash, 0x5fdb_7b92_986b_6fc1);
+    let state = rl::build_deck_pair_state(CAST_CONTINUATION_SEED, burn.card_ids, burn.card_ids)
+        .expect("cataloged Burn mirror passes deck preflight");
+    let opening_hand = &state.players[PlayerId::P0.index()].hand;
+    assert!(opening_hand
+        .iter()
+        .any(|id| state.objects.get(*id).card_def == mountain));
+    assert!(opening_hand
+        .iter()
+        .any(|id| state.objects.get(*id).card_def == bolt));
+    state
+}
+
+#[test]
+fn pending_cast_targets_keep_the_caster_until_the_cast_commits() {
+    let mut state = burn_start_with_mountain_and_bolt();
+    let decision = first_p0_main1(&mut state);
+    let Decision::CastSpellOrPass { land_drops, .. } = decision else {
+        unreachable!()
+    };
+    let mountain = land_drops
+        .into_iter()
+        .find(|id| state.objects.get(*id).card_def == card_id_by_name("Mountain").unwrap())
+        .expect("Burn opening has a legal Mountain land drop");
+    engine::step(&mut state, Action::PlayLand(mountain)).unwrap();
+
+    let Decision::CastSpellOrPass { mana_abilities, .. } =
+        engine::advance_until_decision(&mut state)
+    else {
+        panic!("P0 must retain priority after a land play")
+    };
+    assert!(mana_abilities.contains(&mountain));
+    engine::step(&mut state, Action::ActivateManaAbility(mountain)).unwrap();
+
+    let Decision::CastSpellOrPass {
+        player,
+        castable_spells,
+        ..
+    } = engine::advance_until_decision(&mut state)
+    else {
+        panic!("mana activation must return to a priority decision")
+    };
+    assert_eq!(player, PlayerId::P0);
+    let bolt = castable_spells
+        .into_iter()
+        .find(|id| state.objects.get(*id).card_def == card_id_by_name("Lightning Bolt").unwrap())
+        .expect("the opened {R} pays for Lightning Bolt");
+
+    engine::step(&mut state, Action::CastSpell(bolt)).unwrap();
+    let target_decision = engine::advance_until_decision(&mut state);
+    assert!(matches!(
+        target_decision,
+        Decision::ChooseTargets {
+            player: PlayerId::P0,
+            remaining: 1,
+            ref legal_targets,
+            ..
+        } if legal_targets.contains(&Target::Player(PlayerId::P1))
+    ));
+    assert!(state.engine.pending_cast.is_some());
+    assert_eq!(state.stack.last().unwrap().source, bolt);
+    assert!(state.stack.last().unwrap().targets.is_empty());
+
+    let before_illegal_pass = state.clone();
+    assert!(engine::step(&mut state, Action::Pass).is_err());
+    assert_eq!(
+        state, before_illegal_pass,
+        "pending cast must reject priority actions transactionally"
+    );
+
+    engine::step(
+        &mut state,
+        Action::ChooseTarget(Target::Player(PlayerId::P1)),
+    )
+    .unwrap();
+    assert_eq!(
+        state.engine.pending_cast.as_ref().unwrap().targets_chosen,
+        [Target::Player(PlayerId::P1)],
+        "target answer remains a partial PendingCast until engine advancement"
+    );
+    let after_cast = engine::advance_until_decision(&mut state);
+    assert!(matches!(
+        after_cast,
+        Decision::CastSpellOrPass {
+            player: PlayerId::P0,
+            ..
+        }
+    ));
+    assert!(state.engine.pending_cast.is_none());
+    let finalized = state.stack.last().unwrap();
+    assert_eq!(finalized.source, bolt);
+    assert_eq!(finalized.targets, [Target::Player(PlayerId::P1)]);
+
+    engine::step(&mut state, Action::Pass).unwrap();
+    assert!(matches!(
+        engine::advance_until_decision(&mut state),
+        Decision::CastSpellOrPass {
+            player: PlayerId::P1,
+            ..
+        }
+    ));
+    assert!(state.engine.pending_cast.is_none());
+    eprintln!(
+        "CAST_CONSTRUCTION seed={CAST_CONTINUATION_SEED:#x} actor_before_commit=P0 actor_after_commit=P0 opponent_priority_after_pass=P1 stack_source={bolt:?}"
+    );
+}
+
+fn fixture_object(state: &mut GameState, player: PlayerId, name: &str, zone: Zone) -> ObjectId {
+    let card_def = card_id_by_name(name).unwrap_or_else(|| panic!("{name} is in CARD_DEFS"));
+    let id = state.objects.push(GameObject {
+        card_def,
+        name: name.to_string(),
+        owner: player,
+        controller: player,
+        zone,
+        tapped: false,
+        summoning_sick: false,
+        damage: 0,
+        counters: Counters::default(),
+        attachments: Vec::new(),
+        v4: ObjectStateV4::from_card_def(card_def),
+        spell_copy_origin: None,
+        plotted_turn: None,
+        zone_change_count: 0,
+    });
+    match zone {
+        Zone::Battlefield => state.players[player.index()].battlefield.push(id),
+        Zone::Hand => state.players[player.index()].hand.push(id),
+        other => panic!("fixture_object only installs battlefield/hand objects, got {other:?}"),
+    }
+    id
+}
+
+fn protocol_empty_state(seed: u64) -> GameState {
+    GameState::new_from_libraries(&[], &[], card_name, seed)
+}
+
+fn settle_fireblast_mode(
+    mut state: GameState,
+    mode: CastMode,
+    sacrifice: &[ObjectId],
+) -> GameState {
+    engine::step(&mut state, Action::ChooseCastMode(mode)).unwrap();
+    let mut next = engine::advance_until_decision(&mut state);
+    for &object in sacrifice {
+        let Decision::ChooseCostTargets {
+            player: PlayerId::P0,
+            cost_kind: crate::engine::CostKind::SacrificeLands,
+            candidates,
+            ..
+        } = next
+        else {
+            panic!("alternative Fireblast mode must expose its sacrifice choice: {next:?}")
+        };
+        assert!(candidates.contains(&object));
+        engine::step(&mut state, Action::ChooseCostTarget(object)).unwrap();
+        next = engine::advance_until_decision(&mut state);
+    }
+    assert!(matches!(
+        next,
+        Decision::CastSpellOrPass {
+            player: PlayerId::P0,
+            ..
+        }
+    ));
+    assert!(state.engine.pending_cast.is_none());
+    state
+}
+
+#[test]
+fn fireblast_modes_and_object_payment_paths_remain_distinct() {
+    let burn = runtime_deck_by_id("Burn").unwrap();
+    let mountain_def = card_id_by_name("Mountain").unwrap();
+    let fireblast_def = card_id_by_name("Fireblast").unwrap();
+    assert!(burn.card_ids.contains(&mountain_def));
+    assert!(burn.card_ids.contains(&fireblast_def));
+
+    // Protocol-only synthetic board: all six existing Mountains and Fireblast
+    // are represented consistently in the public arena and zones. This is not
+    // a claim that the complete board was reached from a legal game start; no
+    // Engine continuation or private field is forged.
+    let mut state = protocol_empty_state(FIREBLAST_PROTOCOL_SEED);
+    state.step = Step::Main1;
+    state.active_player = PlayerId::P0;
+    state.priority_player = PlayerId::P0;
+    let mountains = (0..6)
+        .map(|_| fixture_object(&mut state, PlayerId::P0, "Mountain", Zone::Battlefield))
+        .collect::<Vec<_>>();
+    let fireblast = fixture_object(&mut state, PlayerId::P0, "Fireblast", Zone::Hand);
+
+    let Decision::CastSpellOrPass {
+        player: PlayerId::P0,
+        castable_spells,
+        ..
+    } = engine::advance_until_decision(&mut state)
+    else {
+        panic!("synthetic Fireblast root must be P0 priority")
+    };
+    assert!(castable_spells.contains(&fireblast));
+    engine::step(&mut state, Action::CastSpell(fireblast)).unwrap();
+    assert!(matches!(
+        engine::advance_until_decision(&mut state),
+        Decision::ChooseTargets {
+            player: PlayerId::P0,
+            ..
+        }
+    ));
+    engine::step(
+        &mut state,
+        Action::ChooseTarget(Target::Player(PlayerId::P1)),
+    )
+    .unwrap();
+    let mode_decision = engine::advance_until_decision(&mut state);
+    assert!(matches!(
+        &mode_decision,
+        Decision::ChooseCastMode {
+            player: PlayerId::P0,
+            options,
+            ..
+        } if options == &[CastMode::Normal, CastMode::Alternative]
+    ));
+
+    let normal = settle_fireblast_mode(state.clone(), CastMode::Normal, &[]);
+    let alternative_a = settle_fireblast_mode(
+        state.clone(),
+        CastMode::Alternative,
+        &[mountains[0], mountains[1]],
+    );
+    let alternative_b =
+        settle_fireblast_mode(state, CastMode::Alternative, &[mountains[2], mountains[3]]);
+
+    for successor in [&normal, &alternative_a, &alternative_b] {
+        let stack_item = successor.stack.last().unwrap();
+        assert_eq!(stack_item.source, fireblast);
+        assert_eq!(stack_item.targets, [Target::Player(PlayerId::P1)]);
+    }
+    assert!(mountains
+        .iter()
+        .all(|id| normal.players[PlayerId::P0.index()]
+            .battlefield
+            .contains(id)));
+    let alternative_a_graveyard = &alternative_a.players[PlayerId::P0.index()].graveyard;
+    let alternative_b_graveyard = &alternative_b.players[PlayerId::P0.index()].graveyard;
+    assert_eq!(alternative_a_graveyard.len(), 2);
+    assert_eq!(alternative_b_graveyard.len(), 2);
+    assert!(alternative_a_graveyard.contains(&mountains[0]));
+    assert!(alternative_a_graveyard.contains(&mountains[1]));
+    assert!(alternative_b_graveyard.contains(&mountains[2]));
+    assert!(alternative_b_graveyard.contains(&mountains[3]));
+    assert_ne!(
+        normal, alternative_a,
+        "normal and sacrifice payment paths differ"
+    );
+    assert_ne!(
+        alternative_a, alternative_b,
+        "different legal sacrifice ObjectIds remain distinct"
+    );
+}
+
+#[test]
+fn apnap_trigger_group_can_yield_a_distinct_opponent_decision() {
+    let mut state = protocol_empty_state(APNAP_BATCH_SEED);
+    state.active_player = PlayerId::P0;
+    let p0_a = fixture_object(
+        &mut state,
+        PlayerId::P0,
+        "Clockwork Percussionist",
+        Zone::Battlefield,
+    );
+    let p0_b = fixture_object(
+        &mut state,
+        PlayerId::P0,
+        "Clockwork Percussionist",
+        Zone::Battlefield,
+    );
+    let p1_a = fixture_object(
+        &mut state,
+        PlayerId::P1,
+        "Clockwork Percussionist",
+        Zone::Battlefield,
+    );
+    let p1_b = fixture_object(
+        &mut state,
+        PlayerId::P1,
+        "Clockwork Percussionist",
+        Zone::Battlefield,
+    );
+
+    event::propose_and_commit_batch(
+        &mut state,
+        [p0_a, p0_b, p1_a, p1_b]
+            .into_iter()
+            .map(|source| ProposedEvent::zone_change(source, Zone::Graveyard))
+            .collect(),
+    );
+    let pending = crate::trigger::collect_and_process(&mut state);
+    assert_eq!(pending.len(), 4);
+    assert_eq!(
+        pending
+            .iter()
+            .map(|trigger| trigger.controller)
+            .collect::<Vec<_>>(),
+        [PlayerId::P0, PlayerId::P0, PlayerId::P1, PlayerId::P1]
+    );
+    state.engine.pending_triggers.extend(pending);
+
+    let first = engine::advance_until_decision(&mut state);
+    assert!(matches!(
+        &first,
+        Decision::OrderTriggers {
+            player: PlayerId::P0,
+            pending,
+        } if pending.len() == 2
+    ));
+    engine::step(&mut state, Action::OrderTriggers(vec![1, 0])).unwrap();
+    assert_eq!(
+        state.stack.len(),
+        2,
+        "P0's ordered triggers are placed first"
+    );
+    assert_eq!(state.engine.pending_triggers.len(), 2);
+    assert!(state
+        .engine
+        .pending_triggers
+        .iter()
+        .all(|trigger| trigger.controller == PlayerId::P1));
+
+    assert!(matches!(
+        engine::advance_until_decision(&mut state),
+        Decision::OrderTriggers {
+            player: PlayerId::P1,
+            pending,
+        } if pending.len() == 2
+    ));
+    assert_eq!(state.stack.len(), 2, "no priority window intervenes");
+}
+
+#[test]
+fn h2_multi_card_discard_is_a_same_actor_microstep_scan_then_one_commit() {
+    let mut state = protocol_empty_state(0x02e0_0004);
+    let discards = (0..3)
+        .map(|_| fixture_object(&mut state, PlayerId::P0, "Mountain", Zone::Hand))
+        .collect::<Vec<_>>();
+    let hand_before = state.players[PlayerId::P0.index()].hand.clone();
+    state.engine.pending_discard = Some(crate::engine::PendingDiscard {
+        player: PlayerId::P0,
+        count: 2,
+        resume: crate::engine::DiscardResume::None,
+    });
+    let mut surface = HarnessSurfaceV2::new();
+
+    let first = surface.next_decision(&mut state);
+    let SurfaceDecision::Decision(Decision::Discard {
+        player: PlayerId::P0,
+        count: 1,
+        choices: first_choices,
+    }) = first
+    else {
+        panic!("H2 must surface the first single-card discard microstep: {first:?}")
+    };
+    assert_eq!(first_choices, discards);
+    let first_candidates = legal_action_candidates_v5(
+        &PolicyDecisionV5::Surface(SurfaceDecision::Decision(Decision::Discard {
+            player: PlayerId::P0,
+            count: 1,
+            choices: first_choices.clone(),
+        })),
+        &state,
+    )
+    .unwrap();
+    assert_eq!(first_candidates.len(), 3);
+    assert_ne!(
+        first_candidates[0].record.semantic, first_candidates[1].record.semantic,
+        "different discarded ObjectIds remain distinct V5 actions"
+    );
+
+    surface
+        .apply(
+            &mut state,
+            SurfaceAction::Action(Action::Discard(vec![first_choices[0]])),
+        )
+        .unwrap();
+    assert_eq!(state.players[PlayerId::P0.index()].hand, hand_before);
+    assert!(state.engine.pending_discard.is_some());
+
+    let second = surface.next_decision(&mut state);
+    let SurfaceDecision::Decision(Decision::Discard {
+        player: PlayerId::P0,
+        count: 1,
+        choices: second_choices,
+    }) = second
+    else {
+        panic!("H2 must surface the second single-card discard microstep: {second:?}")
+    };
+    assert_eq!(second_choices.len(), 2);
+    assert!(!second_choices.contains(&first_choices[0]));
+    surface
+        .apply(
+            &mut state,
+            SurfaceAction::Action(Action::Discard(vec![second_choices[0]])),
+        )
+        .unwrap();
+
+    assert!(state.engine.pending_discard.is_none());
+    assert_eq!(state.players[PlayerId::P0.index()].hand.len(), 1);
+    assert_eq!(state.players[PlayerId::P0.index()].graveyard.len(), 2);
+    assert_eq!(
+        state.players[PlayerId::P0.index()].graveyard,
+        [first_choices[0], second_choices[0]]
+    );
+}
+
+#[test]
+fn raw_v5_rejects_unreshaped_combat_and_multi_card_discard_protocols() {
+    let mut state = protocol_empty_state(RAW_V5_REJECTION_SEED);
+    state.step = Step::DeclareAttackers;
+    let raw_empty_attackers =
+        PolicyDecisionV5::Surface(SurfaceDecision::Decision(Decision::DeclareAttackers {
+            player: PlayerId::P0,
+            eligible: Vec::new(),
+        }));
+    let attackers_error = legal_action_candidates_v5(&raw_empty_attackers, &state).unwrap_err();
+    assert!(attackers_error
+        .to_string()
+        .contains("aggregate combat semantic is forbidden"));
+
+    let raw_blockers =
+        PolicyDecisionV5::Surface(SurfaceDecision::Decision(Decision::DeclareBlockers {
+            player: PlayerId::P1,
+            attackers: Vec::new(),
+            legal_blockers: Vec::new(),
+        }));
+    let blockers_error = legal_action_candidates_v5(&raw_blockers, &state).unwrap_err();
+    assert!(blockers_error
+        .to_string()
+        .contains("raw DeclareBlockers is not"));
+
+    let multi_discard = PolicyDecisionV5::Surface(SurfaceDecision::Decision(Decision::Discard {
+        player: PlayerId::P0,
+        count: 2,
+        choices: Vec::new(),
+    }));
+    let discard_error = legal_action_candidates_v5(&multi_discard, &state).unwrap_err();
+    assert!(discard_error
+        .to_string()
+        .contains("expected count=1 after H2 reshape"));
+}
