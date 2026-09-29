@@ -1324,6 +1324,86 @@ mod tests {
     }
 
     #[test]
+    fn adversarial_control_differential_checks_every_interval_and_root_certificate() {
+        let f = crate::oracle_suite_v1::adversarial_control_fixture_v1();
+        let truth = f.solve_oracle_v1().unwrap();
+        assert_eq!(truth.root_value, DRAW_V1);
+        assert_eq!(truth.optimal_root_actions, ["safe-a", "safe-b"]);
+        assert_eq!(
+            truth.complete_legal_root_actions,
+            ["safe-a", "safe-b", "risky"]
+        );
+
+        let root_edges = f.node(f.root).unwrap().edges();
+        let mut search = MadsGraphV1::new(&f).unwrap();
+        loop {
+            // Eager action admission means every legal root action must remain
+            // visible even when its successor has not been constructed yet.
+            let action_bounds = search.root_action_bounds_v1();
+            assert_eq!(
+                action_bounds
+                    .iter()
+                    .map(|action| action.stable_id.as_str())
+                    .collect::<Vec<_>>(),
+                truth
+                    .complete_legal_root_actions
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            );
+            for (root_edge, action) in root_edges.iter().zip(&action_bounds) {
+                assert_eq!(action.order, root_edge.order);
+                if !action.expanded {
+                    assert_eq!(action.bounds, BoundIntervalV1::UNKNOWN);
+                }
+                let exact_action_value = truth.node_values[&root_edge.child];
+                assert!(action.bounds.lower <= exact_action_value);
+                assert!(exact_action_value <= action.bounds.upper);
+            }
+
+            for node in search.nodes() {
+                let exact = truth.node_values[&node.fixture_key()];
+                let bounds = node.bounds();
+                assert!(
+                    bounds.is_valid() && bounds.lower <= exact && exact <= bounds.upper,
+                    "MADS bounds {:?} excluded oracle value {exact} at {:?}",
+                    bounds,
+                    node.fixture_key()
+                );
+            }
+            let root_bounds = search.root_bounds();
+            assert!(root_bounds.lower <= truth.root_value && truth.root_value <= root_bounds.upper);
+            let partial_result = search.result_v1();
+            assert!(partial_result
+                .certified_optimal_actions
+                .iter()
+                .all(|action| truth.optimal_root_actions.contains(action)));
+            assert!(partial_result
+                .chosen_action
+                .as_ref()
+                .is_none_or(|action| truth.optimal_root_actions.contains(action)));
+
+            if search.expand_next_v1().unwrap().is_none() {
+                break;
+            }
+        }
+
+        let result = search.result_v1();
+        assert_eq!(result.status, CertificationStatusV1::Certified);
+        assert_eq!(result.root_bounds, BoundIntervalV1::exact(truth.root_value));
+        assert_eq!(result.certified_optimal_actions, truth.optimal_root_actions);
+        assert_eq!(
+            result.certified_unique_action, None,
+            "the oracle has a root tie"
+        );
+        assert!(result
+            .chosen_action
+            .as_ref()
+            .is_some_and(|action| truth.optimal_root_actions.contains(action)));
+        assert!(result.root_actions.iter().all(|action| action.expanded));
+    }
+
+    #[test]
     fn certified_choice_comes_from_the_proven_set_when_lower_bounds_tie() {
         let f = fixture(
             vec![edge(0, "A", 1), edge(1, "B", 2)],
