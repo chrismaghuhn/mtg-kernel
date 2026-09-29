@@ -87,6 +87,8 @@ pub mod mana;
 // module is not a live-Magic searcher and does not enable an engine TT.
 #[cfg(test)]
 mod mads02b_engine_probe_v1;
+#[cfg(test)]
+mod mads02f_c_oracle_stress_v1;
 pub mod mads_v1;
 // Versioned structural-identity contract for a future real-engine MADS key.
 // This is deliberately not connected to the dynamic scheduler or any TT.
