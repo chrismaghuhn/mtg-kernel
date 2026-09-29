@@ -3336,6 +3336,41 @@ mod tests {
         assert_ne!(a.diagnostic_state_hash(), b.diagnostic_state_hash());
     }
 
+    /// Paired states below deliberately keep the visible board empty and
+    /// otherwise identical. They are counterexamples to any key that only
+    /// looks at permanents/life totals, and compare the actual structural
+    /// `GameState` equality contract rather than treating a digest as proof.
+    #[test]
+    fn exact_state_pairs_reject_future_relevant_differences() {
+        let (lib0, lib1) = two_card_libraries();
+        let base = GameState::new_from_libraries(&lib0, &lib1, debug_names, 99);
+
+        let mut reordered_library = base.clone();
+        reordered_library.players[0].library.swap(0, 1);
+        assert_ne!(base, reordered_library, "library order determines future draws");
+
+        let mut advanced_rng = base.clone();
+        match &mut advanced_rng.randomness {
+            GameRandomnessState::Legacy(rng) => {
+                rng.next_u64();
+            }
+            GameRandomnessState::EnvironmentV2(_) => panic!("capture state is legacy"),
+        }
+        assert_ne!(base, advanced_rng, "the future random stream differs");
+
+        let mut different_priority = base.clone();
+        different_priority.priority_player = PlayerId::P1;
+        assert_ne!(base, different_priority, "the next decision actor differs");
+
+        let mut different_allocator = base.clone();
+        different_allocator.engine.next_stack_item_id += 1;
+        assert_ne!(base, different_allocator, "future stack incarnation ids differ");
+
+        let mut different_priority_protocol = base.clone();
+        different_priority_protocol.engine.priority_passes[0] = true;
+        assert_ne!(base, different_priority_protocol, "priority pass bookkeeping differs");
+    }
+
     #[test]
     fn diagnostic_state_hash_includes_rng_and_pending_source_contract() {
         let (lib0, lib1) = two_card_libraries();
