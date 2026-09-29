@@ -88,6 +88,8 @@ pub mod mana;
 #[cfg(test)]
 mod mads02b_engine_probe_v1;
 #[cfg(test)]
+mod mads02e_structured_decision_audit_v1;
+#[cfg(test)]
 mod mads02f_c_oracle_stress_v1;
 pub mod mads_v1;
 // Versioned structural-identity contract for a future real-engine MADS key.
