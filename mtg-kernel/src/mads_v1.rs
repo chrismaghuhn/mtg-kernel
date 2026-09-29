@@ -71,44 +71,6 @@ pub(crate) fn critical_support_v1(
     }
 }
 
-pub(crate) type FrontierSortKeyV1 = (
-    u8,
-    std::cmp::Reverse<u8>,
-    u16,
-    u16,
-    Vec<u32>,
-    ExpansionSemanticOrderV1,
-);
-
-pub(crate) fn frontier_sort_key_v1(
-    role_mask: u8,
-    bound_width: u8,
-    min_root_distance: u16,
-    estimated_cost_bucket: u16,
-    owner_semantic_path: Vec<u32>,
-    semantic_order: ExpansionSemanticOrderV1,
-) -> FrontierSortKeyV1 {
-    let both = role_mask & ExpansionRoleMaskV1::INCUMBENT_LOWER != 0
-        && role_mask & ExpansionRoleMaskV1::CHALLENGER_UPPER != 0;
-    let role_rank = if both {
-        0
-    } else if role_mask & ExpansionRoleMaskV1::INCUMBENT_LOWER != 0 {
-        1
-    } else if role_mask & ExpansionRoleMaskV1::CHALLENGER_UPPER != 0 {
-        2
-    } else {
-        3
-    };
-    (
-        role_rank,
-        std::cmp::Reverse(bound_width),
-        min_root_distance,
-        estimated_cost_bucket,
-        owner_semantic_path,
-        semantic_order,
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MadsRoleV1 {
     Max,
@@ -339,13 +301,40 @@ pub(crate) enum ExpansionSemanticOrderV1 {
 }
 
 impl ExpansionTaskV1 {
-    fn scheduler_key(&self) -> FrontierSortKeyV1 {
-        frontier_sort_key_v1(
-            self.role_mask.0,
-            self.bound_width,
+    fn role_rank(&self) -> u8 {
+        if self.role_mask.supports_both_primary() {
+            0
+        } else if self
+            .role_mask
+            .contains(ExpansionRoleMaskV1::INCUMBENT_LOWER)
+        {
+            1
+        } else if self
+            .role_mask
+            .contains(ExpansionRoleMaskV1::CHALLENGER_UPPER)
+        {
+            2
+        } else {
+            3
+        }
+    }
+
+    fn scheduler_key(
+        &self,
+    ) -> (
+        u8,
+        std::cmp::Reverse<u8>,
+        u16,
+        u16,
+        FixtureNodeId,
+        ExpansionSemanticOrderV1,
+    ) {
+        (
+            self.role_rank(),
+            std::cmp::Reverse(self.bound_width),
             self.min_root_distance,
             self.estimated_cost_bucket,
-            self.owner_semantic_path.clone(),
+            self.owner,
             self.construction_key_or_action_order.clone(),
         )
     }

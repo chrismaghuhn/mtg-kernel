@@ -5,10 +5,48 @@
 use crate::engine::{self, Action, Decision};
 use crate::ids::PlayerId;
 use crate::mads_v1::{
-    backup_bounds_v1, critical_support_v1, frontier_sort_key_v1, BoundIntervalV1,
-    ExpansionRoleMaskV1, ExpansionSemanticOrderV1, MadsRoleV1, WIN_V1,
+    backup_bounds_v1, critical_support_v1, BoundIntervalV1, ExpansionRoleMaskV1,
+    ExpansionSemanticOrderV1, MadsRoleV1, WIN_V1,
 };
 use crate::state::GameState;
+
+type DynamicFrontierSortKeyV1 = (
+    u8,
+    std::cmp::Reverse<u8>,
+    u16,
+    u16,
+    Vec<u32>,
+    ExpansionSemanticOrderV1,
+);
+
+pub(crate) fn dynamic_path_frontier_sort_key_v1(
+    role_mask: u8,
+    width: u8,
+    distance: u16,
+    cost_bucket: u16,
+    owner_path: Vec<u32>,
+    semantic_order: ExpansionSemanticOrderV1,
+) -> DynamicFrontierSortKeyV1 {
+    let role_rank = if role_mask & ExpansionRoleMaskV1::INCUMBENT_LOWER != 0
+        && role_mask & ExpansionRoleMaskV1::CHALLENGER_UPPER != 0
+    {
+        0
+    } else if role_mask & ExpansionRoleMaskV1::INCUMBENT_LOWER != 0 {
+        1
+    } else if role_mask & ExpansionRoleMaskV1::CHALLENGER_UPPER != 0 {
+        2
+    } else {
+        3
+    };
+    (
+        role_rank,
+        std::cmp::Reverse(width),
+        distance,
+        cost_bucket,
+        owner_path,
+        semantic_order,
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicSearchStatusV1 {
@@ -107,8 +145,8 @@ struct DynamicExpansionTask {
 }
 
 impl DynamicExpansionTask {
-    fn sort_key(&self) -> crate::mads_v1::FrontierSortKeyV1 {
-        frontier_sort_key_v1(
+    fn sort_key(&self) -> DynamicFrontierSortKeyV1 {
+        dynamic_path_frontier_sort_key_v1(
             self.role_mask,
             self.bound_width,
             self.min_root_distance,
@@ -133,7 +171,7 @@ pub struct DynamicEngineSearchV1 {
 
 impl DynamicEngineSearchV1 {
     pub const API_VERSION: u16 = 1;
-    pub const FRONTIER_POLICY: &'static str = crate::mads_v1::FRONTIER_POLICY_V1;
+    pub const FRONTIER_POLICY: &'static str = "FRONTIER_REBUILD_DYNAMIC_PATH_V1";
     pub const SUPPORTED_DECISION_KINDS: &'static [&'static str] =
         &["CastSpellOrPass", "DeclareAttackers(empty)", "GameOver"];
 
@@ -177,6 +215,48 @@ impl DynamicEngineSearchV1 {
     }
 
     #[cfg(test)]
+    pub(crate) fn debug_frontier_v1(
+        &self,
+    ) -> Vec<(String, u8, u8, u16, u16, Vec<u32>, Vec<usize>)> {
+        let mut tasks = self.build_frontier_v1().into_values().collect::<Vec<_>>();
+        tasks.sort_by_key(DynamicExpansionTask::sort_key);
+        tasks
+            .into_iter()
+            .map(|task| {
+                (
+                    self.nodes[task.owner].slots[task.slot].id.clone(),
+                    task.role_mask,
+                    task.bound_width,
+                    task.min_root_distance,
+                    task.estimated_cost_bucket,
+                    task.owner_semantic_path,
+                    task.root_action_support,
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_expand_semantic_task_v1(
+        &mut self,
+        owner_path: &[u32],
+        action_id: &str,
+    ) -> Result<(), DynamicSearchStatusV1> {
+        let Some((owner, slot)) = self.nodes.iter().enumerate().find_map(|(owner, node)| {
+            if node.semantic_path != owner_path {
+                return None;
+            }
+            node.slots
+                .iter()
+                .position(|slot| slot.id == action_id && slot.child.is_none())
+                .map(|slot| (owner, slot))
+        }) else {
+            return Err(DynamicSearchStatusV1::UnresolvedWithinBudget);
+        };
+        self.expand_slot_v1(owner, slot)
+    }
+
+    #[cfg(test)]
     pub(crate) fn debug_result_with_status_v1(
         &self,
         status: DynamicSearchStatusV1,
@@ -216,43 +296,9 @@ impl DynamicEngineSearchV1 {
             let Some((n, a)) = self.next_task() else {
                 break;
             };
-            let (mut state, action, depth) = {
-                let node = &self.nodes[n];
-                (
-                    node.state.clone(),
-                    node.slots[a].action.clone(),
-                    node_depth(&self.nodes, n) + 1,
-                )
-            };
-            self.metrics.state_clones += 1;
-            if engine::step(&mut state, action).is_err() {
-                return self.result(DynamicSearchStatusV1::UnsupportedDecision);
+            if let Err(status) = self.expand_slot_v1(n, a) {
+                return self.result(status);
             }
-            self.metrics.authoritative_transitions += 1;
-            self.metrics.expanded_actions += 1;
-            let decision = engine::advance_until_decision(&mut state);
-            let child = match admit(
-                state,
-                decision,
-                self.root_player,
-                Some(n),
-                depth,
-                &self.nodes,
-            ) {
-                Ok(n) => n,
-                Err(error) if error == "CYCLE_DETECTED" => {
-                    return self.result(DynamicSearchStatusV1::UnresolvedWithinBudget)
-                }
-                Err(_) => return self.result(DynamicSearchStatusV1::UnsupportedDecision),
-            };
-            let mut child = child;
-            child.semantic_path = self.nodes[n].semantic_path.clone();
-            child.semantic_path.push(a as u32);
-            self.metrics.admitted_actions += child.slots.len() as u64;
-            let index = self.nodes.len();
-            self.nodes.push(child);
-            self.nodes[n].slots[a].child = Some(index);
-            self.recompute();
             expanded += 1;
         }
         let status = if self.certified().is_empty() {
@@ -261,6 +307,47 @@ impl DynamicEngineSearchV1 {
             DynamicSearchStatusV1::Certified
         };
         self.result(status)
+    }
+
+    fn expand_slot_v1(&mut self, n: usize, a: usize) -> Result<(), DynamicSearchStatusV1> {
+        let (mut state, action, depth) = {
+            let node = &self.nodes[n];
+            (
+                node.state.clone(),
+                node.slots[a].action.clone(),
+                node_depth(&self.nodes, n) + 1,
+            )
+        };
+        self.metrics.state_clones += 1;
+        if engine::step(&mut state, action).is_err() {
+            return Err(DynamicSearchStatusV1::UnsupportedDecision);
+        }
+        self.metrics.authoritative_transitions += 1;
+        self.metrics.expanded_actions += 1;
+        let decision = engine::advance_until_decision(&mut state);
+        let child = match admit(
+            state,
+            decision,
+            self.root_player,
+            Some(n),
+            depth,
+            &self.nodes,
+        ) {
+            Ok(n) => n,
+            Err(error) if error == "CYCLE_DETECTED" => {
+                return Err(DynamicSearchStatusV1::UnresolvedWithinBudget)
+            }
+            Err(_) => return Err(DynamicSearchStatusV1::UnsupportedDecision),
+        };
+        let mut child = child;
+        child.semantic_path = self.nodes[n].semantic_path.clone();
+        child.semantic_path.push(a as u32);
+        self.metrics.admitted_actions += child.slots.len() as u64;
+        let index = self.nodes.len();
+        self.nodes.push(child);
+        self.nodes[n].slots[a].child = Some(index);
+        self.recompute();
+        Ok(())
     }
 
     fn next_task(&self) -> Option<(usize, usize)> {

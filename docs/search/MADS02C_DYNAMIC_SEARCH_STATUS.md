@@ -23,17 +23,23 @@ competitors' upper bounds. Results return both stable IDs and executable
 expansion; latest search status, action certification, and optional exact root
 value are separate fields.
 
-The dynamic path shares MADS-01's conservative bound backup,
-Root-Critical-Support predicate, and frontier sort-key implementation. It
-collects and deduplicates the full current support task set, merges role masks
-and root-action support, then sorts by role rank, descending bound width, root
-distance, estimated cost bucket, semantic action path, and stable action or
-construction order under `FRONTIER_REBUILD_REFERENCE`. The bounded engine
-fixture comparison checks the selected task and every sort-key field after
-each expansion. All currently supported engine actions use cost bucket `1`,
-matching the reference fixture adapter; no unsupported cost estimate is
-claimed. Cycles stop conservatively as unresolved, without inferred repetition
-or GHI semantics.
+MADS-01's existing `FRONTIER_REBUILD_REFERENCE` contract remains unchanged:
+its owner tie-break is `FixtureNodeId`. The dynamic tree has no fixture IDs, so
+its separately versioned policy is `FRONTIER_REBUILD_DYNAMIC_PATH_V1`. It uses
+the same critical-support task formation, role-rank, bound-width,
+root-distance, cost-bucket, and stable action-order criteria, with semantic
+action path as its owner tie-break. A regression fixture proves these owner
+orders can differ and tests both contracts explicitly.
+
+The bounded engine comparison synchronizes expansions using MADS-01's task
+order and compares the complete critical-support task sets after every step
+through frontier exhaustion (more than 64 expansions). This proves task-set
+agreement for the tested path-local tree, not selected-order parity. Scheduler
+parity on an actual engine DAG with multiple parents has not been proven; the
+dynamic engine search does not merge states. All currently supported engine
+actions use cost bucket `1`, matching the bounded reference fixture adapter; no
+finer cost estimate is claimed. Cycles stop conservatively as unresolved,
+without inferred repetition or GHI semantics.
 
 Metrics include authoritative transitions, state clones, admitted/expanded
 actions, bound updates, scheduler rebuilds, and root certification state.
@@ -41,7 +47,7 @@ actions, bound updates, scheduler rebuilds, and root certification state.
 ## Verification
 
 - `cargo check -p mtg-kernel --lib -j 3`: passed after rebase to current `main`.
-- `cargo test -p mtg-kernel --lib mads02b_engine_probe_v1 -j 3`: passed (8 tests), including a per-expansion scheduler parity check and incomplete Burn decision rejection.
+- `cargo test -p mtg-kernel --lib mads02b_engine_probe_v1 -j 3`: passed (9 tests), including the reversed owner-ID/path-order regression and complete relevant-frontier traversal.
 - `cargo test -p mtg-kernel --lib mads_v1 -j 3`: passed (16 tests), including the PR #6 adversarial differential test.
 - `cargo test -p mtg-kernel --lib oracle_suite_v1 -j 3`: passed (4 tests).
 - `cargo fmt --all -- --check`, Clippy with `-D warnings`, and `git diff --check`: passed.

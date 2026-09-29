@@ -1005,23 +1005,26 @@ fn production_dynamic_search_v1_matches_bounded_oracle_and_obeys_budget() {
 }
 
 #[test]
-fn dynamic_frontier_matches_mads01_reference_order_on_bounded_fixture() {
+fn dynamic_frontier_support_matches_mads01_through_complete_relevant_frontier() {
     let enumerated = enumerate_tiny_graph().expect("bounded fixture enumerates");
     let (root_state, root_decision) = tiny_engine_root();
     let mut dynamic = DynamicEngineSearchV1::new(&root_state, root_decision).unwrap();
     let mut reference = MadsGraphV1::new(&enumerated.fixture).unwrap();
-    for _ in 0..64 {
-        let expected = reference
-            .rebuild_frontier_v1()
-            .unwrap()
-            .first()
+    let mut expanded = 0;
+    loop {
+        let reference_frontier = reference.rebuild_frontier_v1().unwrap().to_vec();
+        let mut expected = reference_frontier
+            .iter()
             .map(|task| {
                 (
                     task.action_id.clone(),
-                    task.role_mask
-                        .contains(crate::mads_v1::ExpansionRoleMaskV1::INCUMBENT_LOWER),
-                    task.role_mask
-                        .contains(crate::mads_v1::ExpansionRoleMaskV1::CHALLENGER_UPPER),
+                    u8::from(
+                        task.role_mask
+                            .contains(crate::mads_v1::ExpansionRoleMaskV1::INCUMBENT_LOWER),
+                    ) | (u8::from(
+                        task.role_mask
+                            .contains(crate::mads_v1::ExpansionRoleMaskV1::CHALLENGER_UPPER),
+                    ) << 1),
                     task.bound_width,
                     task.min_root_distance,
                     task.estimated_cost_bucket,
@@ -1031,27 +1034,131 @@ fn dynamic_frontier_matches_mads01_reference_order_on_bounded_fixture() {
                         .map(|&root| root as usize)
                         .collect::<Vec<_>>(),
                 )
-            });
-        let actual = dynamic.debug_next_task_v1().map(
-            |(_state, _decision, action, role_mask, width, distance, cost, path, root_support)| {
-                (
-                    action,
-                    role_mask & crate::mads_v1::ExpansionRoleMaskV1::INCUMBENT_LOWER != 0,
-                    role_mask & crate::mads_v1::ExpansionRoleMaskV1::CHALLENGER_UPPER != 0,
-                    width,
-                    distance,
-                    cost,
-                    path,
-                    root_support,
-                )
-            },
-        );
-        assert_eq!(actual, expected, "frontier order differs from MADS-01");
-        let Some(_) = expected else { break };
-        reference.expand_next_v1().unwrap();
-        let result = dynamic.run_v1(1);
-        assert_ne!(result.status, DynamicSearchStatusV1::UnsupportedDecision);
+            })
+            .collect::<Vec<_>>();
+        let mut actual = dynamic.debug_frontier_v1();
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected, "critical support task sets differ");
+        let Some(task) = reference_frontier.first() else {
+            break;
+        };
+        let picked = reference
+            .expand_next_v1()
+            .unwrap()
+            .expect("frontier task exists");
+        assert_eq!(picked.action_id, task.action_id);
+        dynamic
+            .debug_expand_semantic_task_v1(&task.owner_semantic_path, &task.action_id)
+            .expect("matching dynamic action expands");
+        expanded += 1;
     }
+    assert!(
+        expanded > 64,
+        "test must traverse the entire relevant frontier"
+    );
+    assert_eq!(expanded as u64, reference.metrics().expanded_actions);
+}
+
+#[test]
+fn legacy_fixture_id_tiebreak_and_dynamic_path_tiebreak_are_versioned_separately() {
+    let fixture = OracleFixtureV1 {
+        fixture_id: "fixture-id-vs-path-order-v1".to_owned(),
+        root: FixtureNodeId(100),
+        root_player: FixturePlayerV1::P0,
+        nodes: vec![
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(100),
+                actor: FixturePlayerV1::P0,
+                actions: vec![FixtureEdgeV1 {
+                    stable_id: "root".into(),
+                    order: 0,
+                    child: FixtureNodeId(50),
+                    estimated_cost_bucket: 1,
+                }],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(50),
+                actor: FixturePlayerV1::P0,
+                actions: vec![
+                    FixtureEdgeV1 {
+                        stable_id: "path-00".into(),
+                        order: 0,
+                        child: FixtureNodeId(90),
+                        estimated_cost_bucket: 1,
+                    },
+                    FixtureEdgeV1 {
+                        stable_id: "path-01".into(),
+                        order: 1,
+                        child: FixtureNodeId(20),
+                        estimated_cost_bucket: 1,
+                    },
+                ],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(90),
+                actor: FixturePlayerV1::P1,
+                actions: vec![FixtureEdgeV1 {
+                    stable_id: "leaf-00".into(),
+                    order: 0,
+                    child: FixtureNodeId(91),
+                    estimated_cost_bucket: 1,
+                }],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(20),
+                actor: FixturePlayerV1::P1,
+                actions: vec![FixtureEdgeV1 {
+                    stable_id: "leaf-01".into(),
+                    order: 0,
+                    child: FixtureNodeId(21),
+                    estimated_cost_bucket: 1,
+                }],
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(91),
+                outcome: FixtureOutcomeV1::Loss,
+            },
+            OracleNodeV1::Terminal {
+                id: FixtureNodeId(21),
+                outcome: FixtureOutcomeV1::Loss,
+            },
+        ],
+    };
+    let mut reference = MadsGraphV1::new(&fixture).unwrap();
+    for _ in 0..3 {
+        reference
+            .expand_next_v1()
+            .unwrap()
+            .expect("fixture frontier expands");
+    }
+    let frontier = reference.rebuild_frontier_v1().unwrap();
+    let fixture_id_first = frontier.first().unwrap();
+    let path_first = frontier
+        .iter()
+        .min_by_key(|task| &task.owner_semantic_path)
+        .unwrap();
+    assert_eq!(fixture_id_first.owner, FixtureNodeId(20));
+    assert_eq!(fixture_id_first.owner_semantic_path, [0, 1]);
+    assert_eq!(path_first.owner, FixtureNodeId(90));
+    assert_eq!(path_first.owner_semantic_path, [0, 0]);
+    assert!(
+        crate::dynamic_engine_search_v1::dynamic_path_frontier_sort_key_v1(
+            crate::mads_v1::ExpansionRoleMaskV1::INCUMBENT_LOWER,
+            2,
+            2,
+            1,
+            vec![0, 0],
+            crate::mads_v1::ExpansionSemanticOrderV1::GameAction { action_order: 0 },
+        ) < crate::dynamic_engine_search_v1::dynamic_path_frontier_sort_key_v1(
+            crate::mads_v1::ExpansionRoleMaskV1::INCUMBENT_LOWER,
+            2,
+            2,
+            1,
+            vec![0, 1],
+            crate::mads_v1::ExpansionSemanticOrderV1::GameAction { action_order: 0 },
+        )
+    );
 }
 
 #[test]
