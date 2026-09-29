@@ -17,6 +17,45 @@ use crate::state::GameState;
 
 pub const MADS_DECISION_STATE_KEY_SCHEMA_V1: &str = "mads.decision-state-key.v1";
 
+/// Fail-closed reasons from the owned-session live-capture preflight. This is
+/// deliberately not a key and cannot authorize transposition reuse.
+#[allow(dead_code)] // Reserved for the not-yet-integrated Dynamic MADS boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveDecisionCaptureRejectionV1 {
+    NoCurrentDecision,
+    TerminalSession,
+    StaleSessionBinding,
+    UnsupportedDecisionBoundary,
+    CandidateSnapshotMismatch,
+    DirtyBuild,
+    MissingSchedulerContract,
+}
+
+/// Authenticate the build inputs needed by a live key. Current MADS has no
+/// checked-in engine scheduler contract, so this gate never opens yet.
+#[allow(dead_code)] // Kept closed until DynamicEngineSearch owns this boundary.
+pub(crate) fn authenticated_namespace_gate_v1(
+) -> Result<DecisionStateNamespaceV1, LiveDecisionCaptureRejectionV1> {
+    if env!("MTG_KERNEL_BUILD_GIT_CLEAN") != "true" {
+        return Err(LiveDecisionCaptureRejectionV1::DirtyBuild);
+    }
+    let head = env!("MTG_KERNEL_BUILD_GIT_HEAD");
+    let tree_digest = env!("MTG_KERNEL_BUILD_TRACKED_TREE_SHA256");
+    let tree_contract = env!("MTG_KERNEL_BUILD_TRACKED_TREE_CONTRACT");
+    if head.len() != 40
+        || !head.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || tree_digest.len() != 64
+        || !tree_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || tree_contract.is_empty()
+        || crate::card_def::KERNEL_CARDDB_HASH == 0
+    {
+        return Err(LiveDecisionCaptureRejectionV1::DirtyBuild);
+    }
+    // `FRONTIER_POLICY_V1` is only the synthetic reference scheduler. It is
+    // not an engine search contract and cannot safely namespace a live key.
+    Err(LiveDecisionCaptureRejectionV1::MissingSchedulerContract)
+}
+
 /// Immutable engine/search namespace. Every field participates in equality;
 /// callers must use content identities, not mutable labels, for the values.
 #[derive(Debug, Clone, PartialEq, Eq)]

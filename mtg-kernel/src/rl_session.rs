@@ -4588,6 +4588,54 @@ impl RlEpisodeSessionV1 {
 }
 
 impl FastActorSessionV1 {
+    /// Read-only fail-closed preflight for the future live MADS key boundary.
+    /// It accepts no caller-assembled state/decision/candidate fragments and
+    /// never calls engine advance/step. A successful result would authorize a
+    /// later capture only; at present namespace authentication remains closed.
+    #[allow(dead_code)] // Reserved for integration at a future live search boundary.
+    pub(crate) fn trusted_live_key_capture_preflight_v1(
+        &self,
+    ) -> Result<(), crate::mads_decision_state_key_v1::LiveDecisionCaptureRejectionV1> {
+        use crate::mads_decision_state_key_v1::{
+            authenticated_namespace_gate_v1, LiveDecisionCaptureRejectionV1 as Rejection,
+        };
+
+        if self.terminal.is_some() {
+            return Err(Rejection::TerminalSession);
+        }
+        let current = self.current.as_ref().ok_or(Rejection::NoCurrentDecision)?;
+        if current.environment_revision != self.environment_revision
+            || current.bound_policy_step_count != self.policy_step_count
+            || current.bound_physical_decision_count != self.physical_decision_count
+        {
+            return Err(Rejection::StaleSessionBinding);
+        }
+        let PolicyDecisionV5::Surface(SurfaceDecision::Decision(decision)) =
+            &current.origin_decision
+        else {
+            // Policy-only attacker/blocker scan steps do not have a single
+            // authoritative Engine Decision to key as a game node.
+            return Err(Rejection::UnsupportedDecisionBoundary);
+        };
+        if matches!(
+            decision,
+            Decision::GameOver { .. } | Decision::Halted { .. }
+        ) {
+            return Err(Rejection::UnsupportedDecisionBoundary);
+        }
+        let rebuilt = core_policy_action_candidates_v5(&current.origin_decision, &self.state)
+            .map_err(|_| Rejection::CandidateSnapshotMismatch)?;
+        if rebuilt.is_empty() || rebuilt != current.candidates {
+            return Err(Rejection::CandidateSnapshotMismatch);
+        }
+
+        // Source commit/tree cleanliness and card database hash are checked by
+        // the build-derived gate. It still rejects because no production
+        // DynamicEngineSearch scheduler contract is checked in on this base.
+        authenticated_namespace_gate_v1()?;
+        Ok(())
+    }
+
     pub fn reset(episode_id: u64, env_seed: u64, max_physical_decisions: u64) -> Self {
         let max_policy_steps = max_physical_decisions.saturating_mul(128).max(1);
         Self::reset_with_limits(
@@ -7178,6 +7226,47 @@ mod tests {
 
         assert!(first.exactly_matches(&equal));
         assert!(!first.exactly_matches(&changed));
+    }
+
+    #[test]
+    fn live_key_preflight_rejects_stale_incomplete_and_unsupported_capture_contexts() {
+        use crate::mads_decision_state_key_v1::LiveDecisionCaptureRejectionV1 as Rejection;
+
+        let base = FastActorSessionV1::reset(901, 902, 8);
+        let result = base.trusted_live_key_capture_preflight_v1();
+        let expected_namespace_rejection = if env!("MTG_KERNEL_BUILD_GIT_CLEAN") == "true" {
+            Rejection::MissingSchedulerContract
+        } else {
+            Rejection::DirtyBuild
+        };
+        assert_eq!(result, Err(expected_namespace_rejection));
+
+        let mut stale = base.clone();
+        stale.environment_revision += 1;
+        assert_eq!(
+            stale.trusted_live_key_capture_preflight_v1(),
+            Err(Rejection::StaleSessionBinding)
+        );
+
+        let mut incomplete = base.clone();
+        incomplete.current.as_mut().unwrap().candidates.pop();
+        assert_eq!(
+            incomplete.trusted_live_key_capture_preflight_v1(),
+            Err(Rejection::CandidateSnapshotMismatch)
+        );
+
+        let mut policy_only = base;
+        let current = policy_only.current.as_mut().unwrap();
+        current.origin_decision = PolicyDecisionV5::AttackerInclusion {
+            player: PlayerId::P0,
+            attacker: ObjectId(0),
+            candidate_index: 0,
+            candidate_count: 1,
+        };
+        assert_eq!(
+            policy_only.trusted_live_key_capture_preflight_v1(),
+            Err(Rejection::UnsupportedDecisionBoundary)
+        );
     }
 
     fn attacker_state(count: usize) -> GameState {

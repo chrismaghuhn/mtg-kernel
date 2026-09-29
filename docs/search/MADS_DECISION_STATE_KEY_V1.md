@@ -331,3 +331,154 @@ reuse can be enabled, a future change must:
 No fields have been normalized or excluded, and this PR does not connect the
 contract to MADS scheduling, an engine transposition table, or policy
 observations.
+
+## 12. MADS-02D-C live-boundary audit and fail-closed preflight
+
+Audit commit: `adce843a2d27cb8490fec408e8b77cead2335067` (main, including the
+MADS-02D-B merge PR #8).
+
+### Where decisions are produced
+
+`engine::advance_until_decision(&mut GameState) -> Decision` is the rules
+engine boundary. It is a mutating walk: it validates state, drains pending
+work, advances steps, resolves stacks, and may write `engine.halted` before it
+returns. `PolicySurfaceV5::next_decision` calls that engine function and then
+applies its own mutating suppression/combat-scan protocol. `next_decision_owned`
+also installs an environment-revision binding. Therefore neither function is
+a read-only operation that an arbitrary key builder may call to check a
+caller-supplied Decision.
+
+`RlEpisodeSessionV1::advance_to_decision_or_terminal_profiled` owns one
+exclusive session transition. In that method it obtains `PolicyDecisionV5`,
+checks caps/actor, builds `ObservationV5`, builds the ordered V5 candidates,
+and stores `CurrentDecisionV1`. However, `CurrentDecisionV1` retains actor,
+observation, candidates, and revision/counter bindings, **not the exact
+PolicyDecisionV5 that produced them**. Reconstructing it later would require
+another mutating surface/engine advance. Its boundary is consequently
+insufficient for a trusted full decision key as presently stored.
+
+`FastActorSessionV1::advance_to_decision_or_terminal` performs the analogous
+exclusive transition and stores the exact `PolicyDecisionV5` as
+`FastActorCurrentDecisionV1::origin_decision`, alongside ordered core
+candidates and the revision/counter bindings. The session owns its
+`GameState` and `PolicySurfaceV5`; those fields cannot be independently
+replaced through the public API. This is the closest available capture point.
+It is still not a complete raw-engine capture for every context: attacker and
+blocker inclusion subdecisions are policy-only decisions, and core candidate
+records do not themselves store the full `PolicyActionV5` vector required by
+the existing envelope. Any adapter must reject those unsupported forms and
+recompute/reconcile the ordered full candidates from the saved origin and
+owned state without advancing the engine.
+
+### Components and timing
+
+| Component | Available at the owned FastActor boundary | Limit |
+|---|---|---|
+| Full `GameState`, including EngineState and RNG cursor | Yes, private owned field | Privileged state; never expose to policy/observation. |
+| Exact surfaced `PolicyDecisionV5` | Yes, `origin_decision` | May be policy-only (`AttackerInclusion`/`BlockerInclusion`) with no single raw `engine::Decision`. |
+| Exact raw `Decision` | Only for `PolicyDecisionV5::Surface(SurfaceDecision::Decision(d))` | Other surface subdecisions must fail closed. |
+| Full policy surface and construction scan state | Yes, clone of private `PolicySurfaceV5` | Includes combat scan, selected prefix, cursor, bindings and H2 surface. |
+| Ordered full `PolicyActionV5` candidates | Recomputable from saved origin decision plus state | Must be reconciled exactly with the saved core candidate semantics/order; any mismatch/incomplete vector rejects capture. |
+| Session/revision binding | Yes, full session clone and current revision/counters | Require current bindings to equal session-owned revision/counters before capture. |
+| Engine/content namespace | Build constants exist for commit, clean bit, tracked source tree SHA-256 and generated card DB hash | A dirty build must reject capture. No separately versioned rules or raw Decision schema contract exists; use complete authenticated tracked-tree identity as the rules/decision implementation binding, and retain the explicit schema versions that do exist. |
+
+The key must be captured only from an owned FastActor session method while its
+current record is bound to the same session revision. No API accepting
+independently assembled state/decision/candidates can certify a live key.
+
+### Namespace identity audit
+
+`build.rs` emits `MTG_KERNEL_BUILD_GIT_HEAD`, `MTG_KERNEL_BUILD_GIT_TREE`,
+`MTG_KERNEL_BUILD_GIT_CLEAN`, `MTG_KERNEL_BUILD_TRACKED_TREE_SHA256`, and its
+framing contract. These are build-derived values, unlike caller strings. The
+generated `card_def::KERNEL_CARDDB_HASH` binds the compiled card database.
+Existing schema/version values include `POLICY_SURFACE_VERSION`, RL
+observation/action schema versions, RL session schema/protocol versions,
+`ENVIRONMENT_RANDOMIZATION_IDENTITY_V2`, the frozen legacy state/hash
+contract, and the reserved key schema. There is no explicit raw `Decision`
+schema version, independently versioned rules contract, or live Dynamic MADS
+scheduler contract in this baseline. The authenticated complete source-tree
+digest can bind implementation changes for this build, but it does not
+magically prove semantic equivalence across versions. The MADS scheduler
+namespace must remain unavailable until a real engine scheduler contract is
+checked in.
+
+### Equality and proof gate before code changes
+
+`GameState` and `PolicySurfaceV5` implement `Eq`. `Decision`,
+`PolicyDecisionV5`, `PolicyActionV5`, full session objects, and the existing
+key envelope implement `PartialEq` only. Their current stored fields contain
+no known floating-point members in the live Decision/action path, but the
+trait surface does not guarantee reflexivity for every possible value, and
+the prior test covers a representative fixture rather than every variant.
+The exact equality contract remains structural comparison, with no
+`Eq`/`Hash` claim added here.
+
+Phase-1 conclusion: a complete state/decision/session point exists privately
+inside FastActor session ownership, but the persisted current record does not
+cover every engine decision shape or full candidates. Namespace authentication
+is possible only for clean builds and only for identities that exist. Any
+implementation must be an opaque, read-only, FastActor-owned capture that
+rejects policy-only contexts, candidate mismatches, stale revisions, and
+missing namespace components.
+
+MADS-02D-C adds the versioned, crate-private
+`FastActorSessionV1::trusted_live_key_capture_preflight_v1` contract. It takes
+only an owned FastActor session, checks that the current decision revision and
+counters still match the session, accepts only a surfaced raw engine Decision,
+and rebuilds the core legal candidate list from the saved decision and owned
+state to reject candidate omission/reordering. It never calls engine advance
+or step. If these checks pass, it checks build-derived identity inputs. The
+function currently returns a rejection: the available MADS scheduler
+identities (`FRONTIER_POLICY_V1`/`ACTION_ADMISSION_V1`) describe only the
+isolated fixture reference implementation, not a production live engine
+scheduler. It therefore produces **no key** and cannot authorize reuse.
+
+### Gate and targeted-test status
+
+| Requirement | Status after MADS-02D-C |
+|---|---|
+| T1 exact copy structural equality | PASS for existing owned-envelope fixture and actual session equality tests; `PartialEq` only where noted below. |
+| T2 different Decision recognized | PASS for structural envelope comparison; not an engine-state provenance proof. |
+| T3 candidate reordering recognized | PASS for ordered vector comparison. |
+| T4 policy scan position recognized | PASS for full surface structural comparison. |
+| T5 construction continuation recognized | PASS for generic structural comparison; actual continuation completeness remains tied to the entire owned surface/session clone. |
+| T6 session revision recognized | PASS for structural session equality and preflight stale-binding rejection. |
+| T7 namespace difference recognized | PASS for namespace structural comparison; live namespace still caller supplied in the generic contract. |
+| T8 foreign Decision rejected as live key | **NOT PROVEN**. The preflight does not accept an external Decision, but there is no pure engine validator proving the stored Decision is the unique current engine Decision for that state. Revision and private session ownership establish provenance only for supported session transitions. |
+| T9 incomplete candidates rejected | PASS for mutation/truncation of FastActor's saved core candidate vector; preflight recomputes and compares exact order. Completeness of the candidate generator against every engine action remains a separate proof obligation. |
+| T10 unsupported contexts rejected | PASS for policy-only attacker/blocker scan contexts, terminals, and absent current session decisions. |
+| Namespace authenticates engine/rules/card/schema/RNG/scheduler | **PARTIALLY PROVEN**. Build commit/tree/clean and generated card DB hash are authenticated inputs; no production Dynamic MADS scheduler contract exists. Raw Decision/rules have no independent version const, though the authenticated complete source tree binds their implementation. |
+
+The namespace gate rejects dirty builds before considering capture. A clean
+build still rejects due to the missing scheduler contract. No success-shaped
+placeholder identity or caller-provided namespace is accepted by this gate.
+The generic `DecisionStateKeyContractV1` remains a public equality contract,
+not a trusted live key; its caller-supplied fields remain unsuitable for TT
+admission.
+
+### Hidden-information and scheduler integration firewall
+
+`trusted_live_key_capture_preflight_v1` returns no state, candidate, hash, or
+digest. A future privileged captured key must remain crate-private and must
+never be projected into `ObservationV5`, `InformationSetKey`, policy features,
+replay labels, or teacher labels. It necessarily contains full library/hand
+contents and future RNG state. This PR adds no such projection and no TT use.
+
+Agent A's DynamicEngineSearchV1 contract is not imported. Integration requires
+that scheduler to call an owned-session capture only at a supported live
+decision boundary, compare full keys structurally after any bucket lookup,
+and treat every capture rejection as a cache miss/fail-closed condition. It
+must not call `advance_until_decision` to repair or validate a key, because
+that call mutates the game state.
+
+### Final gate decision
+
+**PARTIALLY_PROVEN capture preflight; trusted live key NOT PROVEN; TT reuse
+CLOSED.** T8 remains an explicit open obligation. Candidate reconstruction
+checks saved-candidate integrity, not universal engine action completeness.
+`Decision`, `PolicyDecisionV5`, `PolicyActionV5`, and session types expose
+`PartialEq`, not `Eq`; representative self-copy comparisons pass, but the
+trait/API does not establish reflexive exact identity for every possible
+value/variant. No `Eq` or `Hash` implementation was added to them or to the
+key envelope.
