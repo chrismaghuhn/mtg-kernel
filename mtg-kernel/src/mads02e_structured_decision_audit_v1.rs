@@ -641,7 +641,7 @@ fn typed_pending_cast_target_adapter_preserves_domain_and_finalizes_only_after_p
             .clone();
         assert_eq!(selected_targets.len(), 1);
         let next = engine::advance_until_decision(&mut branch);
-        assert!(branch.engine.pending_cast.is_none());
+        assert!(branch.objects.get(bolt).v4.finalized_cast_binding.is_some());
         assert!(matches!(
             next,
             Decision::CastSpellOrPass {
@@ -680,4 +680,265 @@ fn typed_pending_cast_target_adapter_preserves_domain_and_finalizes_only_after_p
             ..
         })
     ));
+}
+#[test]
+fn dynamic_v2_tracks_complete_lightning_bolt_root_responses_without_certifying_cast_start() {
+    use crate::dynamic_engine_search_v1::{
+        DynamicEngineSearchV2, DynamicSearchStatusV1, PhysicalActionFinalizationV2,
+    };
+
+    let mut root = protocol_empty_state(0x03b2_0001);
+    root.turn = 1;
+    root.step = Step::Main1;
+    root.active_player = PlayerId::P0;
+    root.priority_player = PlayerId::P0;
+    root.players[PlayerId::P0.index()].mana_pool[3] = 1;
+    let bolt = fixture_object(&mut root, PlayerId::P0, "Lightning Bolt", Zone::Hand);
+    let root_before = root.clone();
+    let root_decision = engine::advance_until_decision(&mut root);
+    assert_eq!(
+        root, root_before,
+        "initial Engine decision must be quiescent"
+    );
+    let Decision::CastSpellOrPass {
+        player,
+        castable_spells,
+        mana_abilities,
+        land_drops,
+        activatable_abilities,
+        plot_actions,
+    } = &root_decision
+    else {
+        panic!("fixture must begin at an authoritative priority decision")
+    };
+    assert_eq!(*player, PlayerId::P0);
+    assert_eq!(castable_spells, &[bolt]);
+    assert!(mana_abilities.is_empty());
+    assert!(land_drops.is_empty());
+    assert!(activatable_abilities.is_empty());
+    assert!(plot_actions.is_empty());
+    let independently_enumerated_root = vec![Action::CastSpell(bolt), Action::Pass];
+    let v5_root = legal_action_candidates_v5(
+        &PolicyDecisionV5::Surface(SurfaceDecision::Decision(root_decision.clone())),
+        &root,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|candidate| match candidate.policy_action {
+        crate::policy_surface_v5::PolicyActionV5::Surface(SurfaceAction::Action(action)) => action,
+        _ => panic!("raw priority action unexpectedly became a policy microstep"),
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(independently_enumerated_root, v5_root);
+
+    let mut search = DynamicEngineSearchV2::new(&root, root_decision.clone()).unwrap();
+    let budget_zero = search.run_v2(0);
+    assert_eq!(
+        budget_zero.status,
+        DynamicSearchStatusV1::UnresolvedWithinBudget
+    );
+    assert_eq!(
+        budget_zero.root_bounds,
+        crate::mads_v1::BoundIntervalV1::UNKNOWN
+    );
+    assert_eq!(budget_zero.exact_root_value, None);
+    assert!(budget_zero.certified_optimal_actions.is_empty());
+    assert!(budget_zero.complete_root_actions.is_empty());
+    assert!(!budget_zero.root_action_domain_complete);
+    assert_eq!(
+        budget_zero
+            .root_engine_actions
+            .iter()
+            .map(|entry| entry.engine_action.clone())
+            .collect::<Vec<_>>(),
+        independently_enumerated_root
+    );
+
+    // The versioned dynamic scheduler spends one expansion to announce Bolt.
+    // It must expose construction candidates without certifying Action::CastSpell.
+    let after_announcement = search.run_v2(1);
+    assert_eq!(after_announcement.metrics.expanded_actions, 1);
+    assert!(after_announcement.certified_optimal_actions.is_empty());
+    assert!(!after_announcement
+        .complete_root_actions
+        .iter()
+        .any(|action| { action.identity.ordered_engine_responses == [Action::CastSpell(bolt)] }));
+    let target_candidates = after_announcement
+        .incomplete_root_frontier
+        .iter()
+        .filter(|frontier| {
+            frontier.ordered_engine_responses.first() == Some(&Action::CastSpell(bolt))
+        })
+        .filter_map(|frontier| frontier.ordered_engine_responses.last().cloned())
+        .collect::<Vec<_>>();
+    let mut post_cast_state = root.clone();
+    engine::step(&mut post_cast_state, Action::CastSpell(bolt)).unwrap();
+    let target_decision = engine::advance_until_decision(&mut post_cast_state);
+    let Decision::ChooseTargets {
+        player: target_actor,
+        spell,
+        remaining,
+        legal_targets,
+        can_finish,
+    } = &target_decision
+    else {
+        panic!("Lightning Bolt must expose its real target stage")
+    };
+    assert_eq!((*target_actor, *spell, *remaining), (PlayerId::P0, bolt, 1));
+    assert!(!can_finish);
+    let expected_targets = legal_targets
+        .iter()
+        .copied()
+        .map(Action::ChooseTarget)
+        .collect::<Vec<_>>();
+    assert_eq!(expected_targets, target_candidates);
+    let v5_targets = legal_action_candidates_v5(
+        &PolicyDecisionV5::Surface(SurfaceDecision::Decision(target_decision.clone())),
+        &post_cast_state,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|candidate| match candidate.policy_action {
+        crate::policy_surface_v5::PolicyActionV5::Surface(SurfaceAction::Action(action)) => action,
+        _ => panic!("raw target candidate unexpectedly became a policy microstep"),
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(target_candidates, v5_targets);
+    let after_second_root_response = search.run_v2(1);
+    assert_eq!(after_second_root_response.metrics.expanded_actions, 2);
+    assert!(after_second_root_response
+        .certified_optimal_actions
+        .is_empty());
+    assert!(after_second_root_response
+        .complete_root_actions
+        .iter()
+        .any(|action| action.identity.ordered_engine_responses == [Action::Pass]));
+    assert_eq!(
+        after_second_root_response
+            .incomplete_root_frontier
+            .iter()
+            .filter(|frontier| {
+                frontier.ordered_engine_responses.first() == Some(&Action::CastSpell(bolt))
+            })
+            .count(),
+        target_candidates.len(),
+        "the public scheduler retains each target as an open construction branch"
+    );
+    for candidate in &target_candidates {
+        let mut branch = root.clone();
+        engine::step(&mut branch, Action::CastSpell(bolt)).unwrap();
+        let observed_target_decision = engine::advance_until_decision(&mut branch);
+        assert_eq!(observed_target_decision, target_decision);
+        engine::step(&mut branch, candidate.clone()).unwrap();
+        let finalized_decision = engine::advance_until_decision(&mut branch);
+        assert!(branch.objects.get(bolt).v4.finalized_cast_binding.is_some());
+        assert!(matches!(
+            finalized_decision,
+            Decision::CastSpellOrPass {
+                player: PlayerId::P0,
+                ..
+            }
+        ));
+        let target = match candidate {
+            Action::ChooseTarget(target) => *target,
+            _ => unreachable!(),
+        };
+        assert_eq!(branch.stack.last().unwrap().targets, [target]);
+        assert!(branch.objects.get(bolt).v4.finalized_cast_binding.is_some());
+    }
+    let result = search.run_v2(8);
+    assert_eq!(
+        result.status,
+        DynamicSearchStatusV1::UnresolvedWithinBudget,
+        "the public scheduler must enumerate the admitted domain without inventing a value"
+    );
+    assert_eq!(result.root_bounds, crate::mads_v1::BoundIntervalV1::UNKNOWN);
+    assert_eq!(result.exact_root_value, None);
+    assert!(result.root_action_domain_complete);
+    assert!(result.incomplete_root_frontier.is_empty());
+    assert_eq!(
+        result.complete_root_actions.len(),
+        target_candidates.len() + 1
+    );
+    assert_eq!(result.metrics.authoritative_transitions, 4);
+    assert_eq!(result.metrics.state_clones, 5);
+
+    assert!(result.complete_root_actions.iter().any(|physical| {
+        physical.identity.ordered_engine_responses == [Action::Pass]
+            && matches!(
+                &physical.identity.finalization_boundary,
+                PhysicalActionFinalizationV2::EngineDecisionReached(Decision::CastSpellOrPass {
+                    player: PlayerId::P1,
+                    ..
+                })
+            )
+    }));
+    let mut identities = std::collections::BTreeSet::new();
+    for physical in result.complete_root_actions.iter().filter(|physical| {
+        matches!(
+            physical.identity.ordered_engine_responses.first(),
+            Some(Action::CastSpell(source)) if *source == bolt
+        )
+    }) {
+        assert!(identities.insert(physical.stable_semantic_identity.clone()));
+        assert_eq!(
+            physical.identity.ordered_engine_responses.len(),
+            2,
+            "the physical answer includes CastSpell and its target response"
+        );
+        assert_eq!(
+            physical.identity.ordered_engine_responses[0],
+            Action::CastSpell(bolt)
+        );
+        let Action::ChooseTarget(target) = physical.identity.ordered_engine_responses[1] else {
+            panic!("complete Bolt identity retains its target answer")
+        };
+        let PhysicalActionFinalizationV2::CastFinalized {
+            source,
+            stack_item,
+            finalized_binding,
+        } = &physical.identity.finalization_boundary
+        else {
+            panic!("complete Bolt response must terminate at authoritative Cast finalization")
+        };
+        assert_eq!(*source, bolt);
+        assert_eq!(stack_item.targets, [target]);
+        assert_eq!(finalized_binding.x_value, 0);
+        assert!(finalized_binding.chosen_creature_cost.is_none());
+        assert_eq!(physical.bounds, crate::mads_v1::BoundIntervalV1::UNKNOWN);
+    }
+    assert_eq!(
+        root, root_before,
+        "search owns state clones and leaves caller root unchanged"
+    );
+}
+#[test]
+fn dynamic_v2_fails_closed_for_out_of_scope_fireblast_construction() {
+    use crate::dynamic_engine_search_v1::{DynamicEngineSearchV2, DynamicSearchErrorV1};
+
+    let mut root = protocol_empty_state(0x03b2_0002);
+    root.step = Step::Main1;
+    root.active_player = PlayerId::P0;
+    root.priority_player = PlayerId::P0;
+    for _ in 0..6 {
+        fixture_object(&mut root, PlayerId::P0, "Mountain", Zone::Battlefield);
+    }
+    let fireblast = fixture_object(&mut root, PlayerId::P0, "Fireblast", Zone::Hand);
+    let root_before = root.clone();
+    let root_decision = engine::advance_until_decision(&mut root);
+    assert!(matches!(
+        &root_decision,
+        Decision::CastSpellOrPass { castable_spells, .. }
+            if castable_spells.contains(&fireblast)
+    ));
+
+    assert_eq!(
+        DynamicEngineSearchV2::new(&root, root_decision).err(),
+        Some(DynamicSearchErrorV1::UnsupportedDecision),
+        "V2 must reject the entire root domain if it includes out-of-scope construction"
+    );
+    assert_eq!(
+        root, root_before,
+        "unsupported construction must preserve caller state"
+    );
 }
