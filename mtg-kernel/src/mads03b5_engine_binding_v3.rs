@@ -21,6 +21,7 @@ use crate::mads_virtual_physical_root_v3::{
     VirtualPhysicalRootV3, VIRTUAL_PHYSICAL_ROOT_SCHEMA_VERSION_V3,
 };
 use crate::state::{FinalizedCastBindingV1, GameState, StackItemKind, Target};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const ENGINE_ACTION_ID_SCHEMA_V3: &str = "engine-action-projection.v3";
@@ -99,6 +100,15 @@ struct AuthoritativeFrameV3 {
     decision: Decision,
     actor: PlayerId,
     candidates: Vec<Action>,
+    candidate_domain_admitted: bool,
+}
+
+#[derive(Debug)]
+struct SuccessorPositionV3 {
+    state: GameState,
+    decision: Decision,
+    actor: PlayerId,
+    candidate_domain_admitted: bool,
 }
 
 #[derive(Debug)]
@@ -114,6 +124,7 @@ pub struct DynamicEngineSearchV3 {
     cast_expanded: bool,
     pass_expanded: bool,
     expanded_targets: Vec<bool>,
+    successor_positions: BTreeMap<String, SuccessorPositionV3>,
     metrics: DynamicEngineSearchMetricsV3,
 }
 
@@ -266,8 +277,43 @@ impl DynamicEngineSearchV3 {
             cast_expanded: false,
             pass_expanded: false,
             expanded_targets: Vec::new(),
+            successor_positions: BTreeMap::new(),
             metrics,
         })
+    }
+
+    pub(crate) fn successor_position_v3(
+        &self,
+        physical_alternative_id: &str,
+    ) -> Option<(&GameState, &Decision, PlayerId, bool)> {
+        self.successor_positions
+            .get(physical_alternative_id)
+            .map(|position| {
+                (
+                    &position.state,
+                    &position.decision,
+                    position.actor,
+                    position.candidate_domain_admitted,
+                )
+            })
+    }
+
+    pub(crate) fn root_actor_v3(&self) -> PlayerId {
+        self.root_actor
+    }
+
+    pub(crate) fn update_successor_bounds_v3(
+        &mut self,
+        physical_alternative_id: &str,
+        bounds: BoundIntervalV1,
+        next_expansion_slot: Option<ExpansionSlotIdentityV3>,
+    ) -> Result<(), EngineBindingErrorV3> {
+        self.virtual_root.update_successor_bounds(
+            physical_alternative_id,
+            bounds,
+            next_expansion_slot,
+        )?;
+        Ok(())
     }
 
     /// Performs at most `compute_budget` authoritative response expansions.
@@ -490,7 +536,7 @@ impl DynamicEngineSearchV3 {
         {
             return Err(EngineBindingErrorV3::InvalidSuccessorFrame);
         }
-        let successor = frame_from_validated_v3(
+        let successor = successor_frame_v3(
             state,
             decision,
             self.session_id,
@@ -522,6 +568,15 @@ impl DynamicEngineSearchV3 {
         })?;
         self.virtual_root
             .complete_alternative(&id, &[response_id], binding)?;
+        self.successor_positions.insert(
+            id,
+            SuccessorPositionV3 {
+                state: successor.state,
+                decision: successor.decision,
+                actor: successor.actor,
+                candidate_domain_admitted: successor.candidate_domain_admitted,
+            },
+        );
         self.pass_expanded = true;
         self.metrics.successor_bindings += 1;
         Ok(())
@@ -662,6 +717,15 @@ impl DynamicEngineSearchV3 {
         })?;
         self.virtual_root
             .complete_alternative(&alternative_id, &responses, binding)?;
+        self.successor_positions.insert(
+            alternative_id.clone(),
+            SuccessorPositionV3 {
+                state: successor.state,
+                decision: successor.decision,
+                actor: successor.actor,
+                candidate_domain_admitted: successor.candidate_domain_admitted,
+            },
+        );
         self.expanded_targets[index] = true;
         self.metrics.successor_bindings += 1;
         Ok(())
@@ -792,20 +856,14 @@ fn frame_from_validated_v3(
     }
     let decision_id = decision_identity_v3(&decision)
         .ok_or(EngineBindingErrorV3::UnsupportedConstructionFrame)?;
-    let mut identity_parts = vec![
-        session.to_string(),
-        ordinal.to_string(),
-        parent.to_owned(),
-        actor.index().to_string(),
-        decision_id,
-        candidate_ids.len().to_string(),
-    ];
-    identity_parts.extend(candidate_ids);
-    let identity_part_refs = identity_parts
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let identity = framed_local_v3("mads.engine-frame.v3", &identity_part_refs);
+    let identity = frame_identity_v3(
+        session,
+        ordinal,
+        parent,
+        actor,
+        &decision_id,
+        &candidate_ids,
+    );
     metrics.candidate_count += candidates.len() as u64;
     Ok(AuthoritativeFrameV3 {
         identity,
@@ -813,7 +871,80 @@ fn frame_from_validated_v3(
         decision,
         actor,
         candidates,
+        candidate_domain_admitted: true,
     })
+}
+
+fn successor_frame_v3(
+    state: GameState,
+    decision: Decision,
+    session: u64,
+    ordinal: u64,
+    parent: &str,
+    metrics: &mut DynamicEngineSearchMetricsV3,
+) -> Result<AuthoritativeFrameV3, EngineBindingErrorV3> {
+    let unsupported_priority_domain = matches!(
+        &decision,
+        Decision::CastSpellOrPass {
+            mana_abilities,
+            land_drops,
+            activatable_abilities,
+            plot_actions,
+            ..
+        } if !mana_abilities.is_empty()
+            || !land_drops.is_empty()
+            || !activatable_abilities.is_empty()
+            || !plot_actions.is_empty()
+    );
+    if !unsupported_priority_domain {
+        return frame_from_validated_v3(state, decision, session, ordinal, parent, metrics);
+    }
+
+    // Preserve the actual priority successor without claiming that this V3
+    // adapter admitted its complete response domain. The V4 search will
+    // independently admit that exact frame through its Engine search adapter
+    // or keep it blocked and UNKNOWN.
+    let Decision::CastSpellOrPass { player, .. } = &decision else {
+        return Err(EngineBindingErrorV3::UnsupportedConstructionFrame);
+    };
+    let mut verification = state.clone();
+    metrics.state_clones += 1;
+    let reproduced = engine::advance_until_decision(&mut verification);
+    if verification != state || reproduced != decision {
+        return Err(EngineBindingErrorV3::InvalidOrStaleRootFrame);
+    }
+    let actor = *player;
+    let decision_identity = decision_identity_v3(&decision)
+        .ok_or(EngineBindingErrorV3::UnsupportedConstructionFrame)?;
+    Ok(AuthoritativeFrameV3 {
+        identity: frame_identity_v3(session, ordinal, parent, actor, &decision_identity, &[]),
+        state,
+        decision,
+        actor,
+        candidates: Vec::new(),
+        candidate_domain_admitted: false,
+    })
+}
+
+fn frame_identity_v3(
+    session: u64,
+    ordinal: u64,
+    parent: &str,
+    actor: PlayerId,
+    decision_id: &str,
+    candidate_ids: &[String],
+) -> String {
+    let mut parts = vec![
+        session.to_string(),
+        ordinal.to_string(),
+        parent.to_owned(),
+        actor.index().to_string(),
+        decision_id.to_owned(),
+        candidate_ids.len().to_string(),
+    ];
+    parts.extend(candidate_ids.iter().cloned());
+    let part_refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    framed_local_v3("mads.engine-frame.v3", &part_refs)
 }
 fn slot_v3(
     owner: &str,
