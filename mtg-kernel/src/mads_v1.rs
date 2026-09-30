@@ -1555,6 +1555,205 @@ mod tests {
     }
 
     #[test]
+    fn mads03b3_oracle_frontier_uses_complete_physical_root_actions() {
+        let suffix_nodes = vec![
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(2),
+                actor: FixturePlayerV1::P0,
+                actions: vec![edge(0, "win", 5), edge(1, "draw", 6)],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(3),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "loss", 7), edge(1, "draw", 6)],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(4),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "draw", 6), edge(1, "win", 5)],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(8),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "draw", 6), edge(1, "win", 5)],
+            },
+            terminal(5, FixtureOutcomeV1::Win),
+            terminal(6, FixtureOutcomeV1::Draw),
+            terminal(7, FixtureOutcomeV1::Loss),
+        ];
+        let mut construction_nodes = vec![OracleNodeV1::DecisionConstruction {
+            id: FixtureNodeId(1),
+            owner_decision: FixtureNodeId(0),
+            actor: FixturePlayerV1::P0,
+            protocol_key: "lightning-bolt-target-v1".to_owned(),
+            partial_response: "cast-lightning-bolt".to_owned(),
+            continuation_cursor: 1,
+            choices: vec![edge(0, "target-P0", 2), edge(1, "target-P1", 3)],
+        }];
+        construction_nodes.extend(suffix_nodes.clone());
+        let construction_fixture = fixture(
+            vec![
+                edge(0, "cast-lightning-bolt", 1),
+                edge(1, "pass", 4),
+                edge(2, "other", 8),
+            ],
+            construction_nodes,
+        );
+
+        // This oracle view makes each complete physical response a root edge;
+        // its successor is the exact same authoritative post-construction node.
+        let physical_fixture = fixture(
+            vec![
+                edge(0, "cast-bolt/target-P0", 2),
+                edge(1, "cast-bolt/target-P1", 3),
+                edge(2, "pass", 4),
+                edge(3, "other", 8),
+            ],
+            suffix_nodes,
+        );
+        let construction_truth = oracle(&construction_fixture);
+        let physical_truth = oracle(&physical_fixture);
+        assert_eq!(construction_truth.root_value, WIN_V1);
+        assert_eq!(physical_truth.root_value, construction_truth.root_value);
+        assert_eq!(
+            physical_truth.complete_legal_root_actions,
+            [
+                "cast-bolt/target-P0",
+                "cast-bolt/target-P1",
+                "pass",
+                "other"
+            ]
+        );
+        assert_eq!(physical_truth.optimal_root_actions, ["cast-bolt/target-P0"]);
+        assert_eq!(
+            physical_truth.node_values[&FixtureNodeId(2)],
+            WIN_V1,
+            "target P0 leads to a P0-owned MAX continuation"
+        );
+        assert_eq!(
+            physical_truth.node_values[&FixtureNodeId(3)],
+            LOSS_V1,
+            "target P1 leads to a P1-owned MIN continuation"
+        );
+        assert_eq!(physical_truth.node_values[&FixtureNodeId(4)], DRAW_V1);
+        assert_eq!(physical_truth.node_values[&FixtureNodeId(8)], DRAW_V1);
+
+        // MadsGraphV1 preserves its input root-action contract: the nested
+        // construction fixture exposes the cast announcement as one slot.
+        let mut grouped = MadsGraphV1::new(&construction_fixture).unwrap();
+        assert_eq!(grouped.root_action_bounds_v1().len(), 3);
+        force_root_action(&mut grouped, 0);
+        assert_eq!(
+            grouped.root_action_bounds_v1()[0].stable_id,
+            "cast-lightning-bolt"
+        );
+        assert_eq!(
+            grouped
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node, SearchNodeV1::DecisionConstructionNode(_)))
+                .count(),
+            1
+        );
+
+        // The independent root-critical reference works correctly when the
+        // complete physical replies themselves are the root action domain.
+        let mut search = MadsGraphV1::new(&physical_fixture).unwrap();
+        let initial_frontier = search.rebuild_frontier_v1().unwrap().to_vec();
+        assert_eq!(initial_frontier.len(), 2);
+        assert_eq!(initial_frontier[0].action_id, "cast-bolt/target-P0");
+        assert_eq!(initial_frontier[0].root_action_support, [0]);
+        assert!(initial_frontier[0]
+            .role_mask
+            .contains(ExpansionRoleMaskV1::INCUMBENT_LOWER));
+        assert_eq!(initial_frontier[1].action_id, "cast-bolt/target-P1");
+        assert_eq!(initial_frontier[1].root_action_support, [1]);
+        assert!(initial_frontier[1]
+            .role_mask
+            .contains(ExpansionRoleMaskV1::CHALLENGER_UPPER));
+
+        let mut expansions = 0;
+        while let Some(task) = search.expand_next_v1().unwrap() {
+            expansions += 1;
+            assert!(!task.root_action_support.is_empty());
+            let bounds = search.root_action_bounds_v1();
+            assert_eq!(
+                bounds.len(),
+                physical_truth.complete_legal_root_actions.len()
+            );
+            for (edge, action) in physical_fixture
+                .node(physical_fixture.root)
+                .unwrap()
+                .edges()
+                .iter()
+                .zip(&bounds)
+            {
+                assert_eq!(action.stable_id, edge.stable_id);
+                let truth = physical_truth.node_values[&edge.child];
+                assert!(action.bounds.lower <= truth && truth <= action.bounds.upper);
+            }
+            let result = search.result_v1();
+            assert!(result.root_bounds.lower <= physical_truth.root_value);
+            assert!(physical_truth.root_value <= result.root_bounds.upper);
+            assert!(result
+                .certified_optimal_actions
+                .iter()
+                .all(|id| physical_truth.optimal_root_actions.contains(id)));
+            let incumbent = bounds
+                .iter()
+                .max_by_key(|action| (action.bounds.lower, std::cmp::Reverse(action.order)))
+                .unwrap()
+                .order;
+            let challenger = bounds
+                .iter()
+                .filter(|action| action.order != incumbent)
+                .max_by_key(|action| (action.bounds.upper, std::cmp::Reverse(action.order)))
+                .map(|action| action.order);
+            let expected_support = [Some(incumbent), challenger]
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>();
+            let first = search.rebuild_frontier_v1().unwrap().to_vec();
+            let second = search.rebuild_frontier_v1().unwrap().to_vec();
+            assert_eq!(first, second, "frontier rebuild must be deterministic");
+            for task in &first {
+                assert!(task
+                    .root_action_support
+                    .iter()
+                    .all(|root_order| expected_support.contains(root_order)));
+                if task
+                    .role_mask
+                    .contains(ExpansionRoleMaskV1::INCUMBENT_LOWER)
+                {
+                    assert!(task.root_action_support.contains(&incumbent));
+                }
+                if task
+                    .role_mask
+                    .contains(ExpansionRoleMaskV1::CHALLENGER_UPPER)
+                {
+                    assert!(
+                        challenger.is_some_and(|order| task.root_action_support.contains(&order))
+                    );
+                }
+            }
+        }
+        let result = search.result_v1();
+        assert!(expansions > 0);
+        assert_eq!(result.root_bounds, BoundIntervalV1::exact(WIN_V1));
+        assert_eq!(
+            result.certified_optimal_actions,
+            physical_truth.optimal_root_actions
+        );
+        println!(
+            "MADS03B3_ORACLE_FRONTIER fixture=synthetic-bolt-physical-root-v1 root_value={} optimal={:?} root_actions={} expansions={}",
+            physical_truth.root_value,
+            physical_truth.optimal_root_actions,
+            physical_truth.complete_legal_root_actions.len(),
+            expansions
+        );
+    }
+
+    #[test]
     fn fixture_cycle_is_rejected_without_draw_substitution() {
         let f = fixture(vec![edge(0, "cycle", 0)], vec![]);
         assert_eq!(
