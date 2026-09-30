@@ -20,15 +20,15 @@ Command:
 cargo run --locked -p mtg-kernel --example bench_mads_synthetic_v1 -j 3 -- --iterations 100 --budget 64
 ```
 
-Host/build facts:
+This final review-correction run used the clean harness commit below. Both Oracle-equivalent fixtures were checked before the run for equal exact root values, optimal root-action sets, and complete ordered root-action domains.
 
 ```text
 OS / architecture: Windows / x86_64
 CPU identifier: AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD
 Build profile: Debug
-Git HEAD: acefd52621d51993929bf67f0eaebf3c21351146
+Git HEAD: 747bd5a64524dc6013b181a935ba5b2d94c8bc3a
 Build clean: true
-Tracked-tree SHA-256: 8b3d37ff7a87ccdd24801cd7dc0cfac8f34549a47cf6247fffd3216cde16918a
+Tracked-tree SHA-256: 2757ca831c3d149a0296ae48707d8b19536011a95244865f58d19e2c10fc37a2
 Fixture identity: mads03e-oracle-paired-v1-seed-0000000003e00001
 Seed: 0x0000000003e00001 (identity only; no RNG consumed)
 Warmups / measured iterations / expansion budget: 10 / 100 / 64
@@ -36,22 +36,21 @@ Warmups / measured iterations / expansion budget: 10 / 100 / 64
 
 Observed report values:
 
-| Variant | Oracle nodes / edges | Oracle root | Oracle solve wall avg | MADS init wall avg | MADS search wall avg | Search status / value | Certified actions | Fixture interner lookups / hits |
+| Variant | Oracle nodes / edges | Oracle root | Oracle solve wall (single invocation) | MADS init wall avg | MADS search wall avg | Search status / value | Certified actions | Fixture interner lookups / hits |
 |---|---:|---:|---:|---:|---:|---|---|---:|
-| `PATH_LOCAL_TREE_V1` | 5 / 10 | DRAW (0) | 253,700 ns | 49,310 ns | 90,888 ns | Certified / exact DRAW | `[left]` | 7 / 0 |
-| `FIXTURE_ID_DAG_V1` | 4 / 8 | DRAW (0) | 29,400 ns | 36,746 ns | 89,450 ns | Certified / exact DRAW | `[left, right]` | 7 / 2 |
+| `PATH_LOCAL_TREE_V1` | 5 / 10 | DRAW (0) | 173,400 ns | 50,159 ns | 88,494 ns | Certified / exact DRAW | `[left]` | 7 / 0 |
+| `FIXTURE_ID_DAG_V1` | 4 / 8 | DRAW (0) | 26,800 ns | 35,555 ns | 85,372 ns | Certified / exact DRAW | `[left, right]` | 7 / 2 |
 
-Both variants reported `unknown_runs=0/100`, 7 expanded action slots, 8 scheduler rebuilds, 6 bound updates, 0 authoritative Engine transitions, and 0 state clones. The fixture DAG created 6 search nodes versus 8 for the path-local encoding; two duplicate fixture nodes were avoided. The root result certified at least one Oracle-optimal action in every measured run. The certified subsets differ because scheduler expansion histories differ; this is not selected-order parity evidence.
+For every warmup and measured run, the harness requires: MADS root bounds contain the Oracle value; the ordered root-action domain equals the complete Oracle domain; every certified action is Oracle-optimal; a `Certified` status carries a nonempty certificate and an Oracle-optimal chosen certified action; and an unresolved result carries no chosen/certified action. Both variants reported `unknown_runs=0/100`, 7 expanded action slots, 8 scheduler rebuilds, 6 bound updates, 0 authoritative Engine transitions, and 0 state clones. The fixture DAG created 6 search nodes versus 8 for the path-local encoding; two duplicate fixture nodes were avoided.
 
-CPU time was unavailable from the harness, peak RSS was unavailable, and certification cost is included in search wall time rather than separately instrumented. The very small Oracle fixture wall measurements vary enough that the table must not be read as a speed claim. These are harness observations only, not a comparable game-search performance baseline.
+CPU time was unavailable from the harness, peak RSS was unavailable, and certification cost is included in search wall time rather than separately instrumented. These small synthetic timings are noisy harness observations only. The encodings use different fixture graph sizes; this does not establish a comparable search-performance baseline or a Magic speedup.
 
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo run --locked -p mtg-kernel --example bench_mads_synthetic_v1 -j 3 -- --iterations 100 --budget 64` — completed; both encodings passed Oracle root/domain checks.
-- `cargo clippy --locked -p mtg-kernel --example bench_mads_synthetic_v1 -j 3 -- -D warnings` — passed.
+- `cargo run --locked -p mtg-kernel --example bench_mads_synthetic_v1 -j 3 -- --iterations 100 --budget 64` — completed on the clean harness commit; all per-run Oracle checks passed.
+- `cargo clippy --locked -p mtg-kernel --example bench_mads_synthetic_v1 -j 3 -- -D warnings` — passed on the final implementation.
 - No full workspace, Release, Thin-LTO or CUDA suite was run. The optimized benchmark build remains deferred to designated benchmark hardware.
-
 ## Gate decision
 
 ```text
