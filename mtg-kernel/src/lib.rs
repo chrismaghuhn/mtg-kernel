@@ -100,6 +100,7 @@ pub mod mads_decision_state_key_v1;
 // It is not integrated into DynamicEngineSearchV1; incomplete actions cannot be certified.
 #[allow(dead_code)]
 pub(crate) mod mads_decision_construction_v1;
+pub mod mads_virtual_physical_root_v3;
 // Model-guided searcher authority record SCHEMA ONLY (design item 4,
 // `CLAUDE-MODEL-GUIDED-SEARCHER-DESIGN-V1.md` Section 1.4 / 5.3). No
 // dispatch, no science-loop or scorer-bridge wiring; that is item 6, its own
