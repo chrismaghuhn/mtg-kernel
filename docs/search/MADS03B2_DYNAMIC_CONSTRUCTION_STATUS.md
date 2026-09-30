@@ -12,11 +12,11 @@ Source: `mtg-kernel/src/dynamic_engine_search_v1.rs`.
 
 - Additive public types: `DynamicEngineSearchV2` (`API_VERSION = 2`), `DynamicSearchResultV2`, `CompletePhysicalActionV2`, `CompletePhysicalActionIdentityV2`, `IncompletePhysicalActionFrontierV2`, and `PhysicalActionFinalizationV2`.
 - The V2 identity is schema-versioned and contains the initiating engine `Decision`, ordered authoritative `Action` responses, and a finalization boundary. A finalized cast additionally captures its source, authoritative stack item and `FinalizedCastBindingV1`. Stable response IDs are framed from the ordered stable action-path IDs.
-- Dynamic V2 expands through the existing path-local scheduler and performs `engine::step` plus `engine::advance_until_decision` on owned state clones. It classifies the resulting frame with `classify_after_transition_v1`; a typed PendingCast target context is retained on a construction node. No TT, state-key normalization or state merging is introduced.
+- Dynamic V2 uses the existing path-local graph and bound propagation, and performs `engine::step` plus `engine::advance_until_decision` on owned state clones. It classifies the resulting frame with `classify_after_transition_v1`; a typed PendingCast target context is retained on a construction node. No TT, state-key normalization or state merging is introduced.
 - V1's public result contract is unchanged. V2 does not reinterpret an existing V1 `chosen_engine_action` as a physical action.
 - The production V2 root admission scope is exactly a priority domain containing one castable Lightning Bolt and Pass, with no mana abilities, land drops, activations or plot actions. Any other root action domain is rejected as unsupported at construction time; V2 does not inherit V1's broader root domain silently.
 - Within that root, V2 admits **Lightning Bolt PendingCast target selection only**. Target candidates come from the authoritative `ChooseTargets` frame and are checked against the existing V5 candidate projection bound to the post-CastSpell state; the selected target is then applied by the authoritative engine transition. Finalization requires the engine to have cleared PendingCast and exposes the actual finalized cast binding and stack object.
-- The V2 public scheduler enumerates all admitted root actions and their construction candidates, then stops at the physical-action boundary. It does not search subsequent game decisions; their outcome values stay `UNKNOWN`. This bounded behavior is intentional until later decision types are admitted with their own contracts.
+- V2 reports `FRONTIER_COMPLETE_PHYSICAL_ROOT_V2`. Its `next_root_completion_task_v2()` policy schedules unexpanded root actions first, then open construction candidates. It is distinct from V1's `FRONTIER_REBUILD_DYNAMIC_PATH_V1` root-critical policy. V2 stops at the physical-action boundary and does not search subsequent game decisions; their outcome values stay `UNKNOWN`. This bounded behavior is intentional until later decision types are admitted with their own contracts.
 - Root-domain enumeration can be complete while root value remains unknown. Open construction prefixes are listed as incomplete and retain `UNKNOWN` bounds. Only complete response paths participate in V2 certification, and any incomplete competitor retains its upper bound. A larger game result is not fabricated.
 
 ## Tested fixture and evidence
@@ -78,7 +78,7 @@ The first public-scheduler regression attempt showed that the debug-driven test 
 - Provide bounded complete Oracle graphs before claiming value-bound or root-certificate correctness for a real cast position.
 - Keep unsupported transitions unresolved; do not infer loss, actor ownership, or completion from an enum change.
 
-No engine rules, `GameState` semantics, RL/replay contracts, trained policy, TT, state-key contract, scheduler contract, POR, cards, training, or shard production were changed.
+No engine rules, `GameState` semantics, RL/replay contracts, trained policy, TT, state-key contract, V1 scheduler contract, POR, cards, training, or shard production were changed. V2's separate scheduler identity and policy are documented above.
 
 ## Gate
 

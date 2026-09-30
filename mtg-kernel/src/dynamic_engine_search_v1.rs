@@ -633,7 +633,7 @@ pub struct DynamicEngineSearchV2 {
 
 impl DynamicEngineSearchV2 {
     pub const API_VERSION: u16 = 2;
-    pub const FRONTIER_POLICY: &'static str = DynamicEngineSearchV1::FRONTIER_POLICY;
+    pub const FRONTIER_POLICY: &'static str = "FRONTIER_COMPLETE_PHYSICAL_ROOT_V2";
 
     pub fn new(
         root_state: &GameState,
