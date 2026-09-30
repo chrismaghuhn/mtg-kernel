@@ -33,7 +33,7 @@ The root backup uses MADS V0.4's conservative MAX interval backup across all vir
 
 ## Root-critical frontier
 
-`rebuild_root_critical_frontier()` recomputes the virtual root incumbent and challenger from their own bound cells, follows their pending physical owner slots, deduplicates a shared slot, unions role masks, and retains separate `root_action_support_ids` and `unresolved_prefix_support_ids`. Its stable sort key is:
+`rebuild_root_critical_frontier()` returns a snapshot that recomputes the virtual root incumbent and challenger from their own bound cells, follows their pending physical owner slots, deduplicates a shared slot, unions role masks, and retains separate `root_action_support_ids` and `unresolved_prefix_support_ids`. Its status distinguishes an unattested domain, ready work, an exhausted frontier, and critical alternatives blocked on an unevaluated successor with no bound-owner task. It does not report an empty blocked frontier as exhausted. `rebuild_root_critical_frontier_snapshot_v3()` is an explicit alias for the snapshot method. Its stable sort key is:
 
 ```text
 (role_rank, -bound_width, min_root_distance, estimated_cost_bucket,
@@ -54,6 +54,7 @@ Test module: `mads_virtual_physical_root_v3::tests`.
 - Prefix admission is checked before/after domain completion, including the open-prefix `[0,+1]` root envelope and no premature Pass certificate.
 - Negative tests reject missing candidate attestations, duplicate physical response paths, mismatched actor, stale owner revision, wrong Construction stage, wrong continuation identity, stale prefix progress, wrong progress actor, invalid owner/response successor bindings, and cyclic graph ancestry. Rejections preserve the envelope or the pre-transition alternative state.
 - Root frontier tasks, role masks, task deduplication, and support IDs are compared against the independent simple enumeration at each relevant tested state.
+- A separate blocker regression sets A to `[0,0]`, B to `UNKNOWN` without a successor task, and C to `UNKNOWN` with a task; although the critical frontier emits no task, the snapshot explicitly reports B as blocked rather than exhausted.
 
 These are synthetic structural/Oracle tests. They prove the standalone V3 data contract only on the executed fixture scope.
 
@@ -75,7 +76,7 @@ Cargo commands were serialized by `Global\\mtg-kernel-cargo-build.lock`, used `-
 
 | Command | Result |
 |---|---|
-| `cargo test --locked -p mtg-kernel --lib mads_virtual_physical_root_v3 -j 3 -- --nocapture` | PASS: 4 passed |
+| `cargo test --locked -p mtg-kernel --lib mads_virtual_physical_root_v3 -j 3 -- --nocapture` | PASS: 5 passed |
 | `cargo test --locked -p mtg-kernel --lib mads_v1 -j 3 -- --nocapture` | PASS: 18 passed |
 | `cargo test --locked -p mtg-kernel --lib mads02e_structured_decision_audit_v1 -j 3 -- --nocapture` | PASS: 8 passed |
 | `cargo test --locked -p mtg-kernel --lib mads02b_engine_probe_v1 -j 3 -- --nocapture` | PASS: 9 passed |

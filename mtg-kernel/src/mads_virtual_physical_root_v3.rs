@@ -144,6 +144,9 @@ pub struct SuccessorBindingV3 {
     pub ordered_engine_responses: Vec<String>,
     pub finalization_boundary: String,
     pub successor_node_id: String,
+    /// First expansion slot exposed by the successor GameDecision, if one is
+    /// available. Missing work is reported as blocked, never as exhausted.
+    pub next_expansion_slot: Option<ExpansionSlotIdentityV3>,
     /// Exact path-local ancestry at the point this successor was admitted.
     /// Repeated IDs are rejected as a cycle; this is not a reusable state key.
     pub graph_path_node_ids: Vec<String>,
@@ -185,6 +188,12 @@ impl SuccessorBindingV3 {
                 != self.graph_path_node_ids.len()
             || provenance_identity.is_empty()
             || provenance_identity != admission_evidence_identity
+            || self.next_expansion_slot.as_ref().is_some_and(|slot| {
+                slot.validate(&self.physical_owner_id, slot.actor).is_err()
+                    || slot.graph_owner_id != self.successor_node_id
+                    || self.next_actor != Some(slot.actor)
+            })
+            || (self.next_actor.is_none() && self.next_expansion_slot.is_some())
         {
             return Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding);
         }
@@ -523,6 +532,22 @@ pub struct RootCriticalTaskV3 {
     pub stable_semantic_tiebreak: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootCriticalFrontierStatusV3 {
+    DomainNotAttested,
+    Ready,
+    ReadyAndBlockedOnUnevaluatedSuccessor,
+    BlockedOnUnevaluatedSuccessor,
+    Exhausted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootCriticalFrontierSnapshotV3 {
+    pub status: RootCriticalFrontierStatusV3,
+    pub tasks: Vec<RootCriticalTaskV3>,
+    pub blocked_on_unevaluated_successor: Vec<String>,
+}
+
 impl RootCriticalTaskV3 {
     pub fn scheduler_key(&self) -> (u8, std::cmp::Reverse<u8>, u16, u16, String, String) {
         (
@@ -826,11 +851,12 @@ impl VirtualPhysicalRootV3 {
             &alternative.identity,
             &alternative.admission_evidence_identity,
         )?;
+        let successor_task = successor_binding.next_expansion_slot.clone();
         alternative.executed_response_prefix = executed_responses.to_vec();
         alternative.successor_binding = Some(successor_binding);
         alternative.state = PhysicalAlternativeStateV3::Completed;
         alternative.bounds = BoundIntervalV1::UNKNOWN;
-        alternative.next_expansion_slot = None;
+        alternative.next_expansion_slot = successor_task;
         Ok(())
     }
 
@@ -838,6 +864,7 @@ impl VirtualPhysicalRootV3 {
         &mut self,
         alternative_id: &str,
         bounds: BoundIntervalV1,
+        next_expansion_slot: Option<ExpansionSlotIdentityV3>,
     ) -> Result<(), VirtualPhysicalRootErrorV3> {
         if !bounds.is_valid() {
             return Err(VirtualPhysicalRootErrorV3::InvalidBounds);
@@ -854,8 +881,15 @@ impl VirtualPhysicalRootV3 {
         if alternative.successor_binding.is_none() {
             return Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding);
         }
+        if next_expansion_slot.as_ref().is_some_and(|slot| {
+            slot.validate(&alternative.identity.physical_owner_id, slot.actor)
+                .is_err()
+        }) {
+            return Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding);
+        }
         alternative.bounds = bounds;
         alternative.state = PhysicalAlternativeStateV3::SuccessorExpanded;
+        alternative.next_expansion_slot = next_expansion_slot;
         Ok(())
     }
 
@@ -904,9 +938,15 @@ impl VirtualPhysicalRootV3 {
             .collect()
     }
 
-    pub fn rebuild_root_critical_frontier(&self) -> Vec<RootCriticalTaskV3> {
+    /// Rebuilds critical tasks and makes an empty-but-incomplete frontier
+    /// explicit instead of treating it as exhausted search.
+    pub fn rebuild_root_critical_frontier(&self) -> RootCriticalFrontierSnapshotV3 {
         if self.root_domain_attestation.is_none() {
-            return Vec::new();
+            return RootCriticalFrontierSnapshotV3 {
+                status: RootCriticalFrontierStatusV3::DomainNotAttested,
+                tasks: Vec::new(),
+                blocked_on_unevaluated_successor: Vec::new(),
+            };
         }
         let mut items = Vec::with_capacity(self.alternatives.len() + self.envelopes.len());
         for (id, alternative) in &self.alternatives {
@@ -936,9 +976,15 @@ impl VirtualPhysicalRootV3 {
             .filter(|item| Some(item.id.as_str()) != incumbent)
             .max_by_key(|item| (item.bounds.upper, std::cmp::Reverse(item.order)))
             .map(|item| item.id.as_str());
+        let mut blocked = Vec::new();
         let mut tasks = BTreeMap::<String, RootCriticalTaskV3>::new();
         for item in &items {
             let Some(task_slot) = &item.task else {
+                let is_critical =
+                    Some(item.id.as_str()) == incumbent || Some(item.id.as_str()) == challenger;
+                if is_critical && item.bounds.width() > 0 {
+                    blocked.push(item.id.clone());
+                }
                 continue;
             };
             let role = if Some(item.id.as_str()) == incumbent {
@@ -982,7 +1028,22 @@ impl VirtualPhysicalRootV3 {
             task.unresolved_prefix_support_ids.dedup();
         }
         frontier.sort_by_key(RootCriticalTaskV3::scheduler_key);
-        frontier
+        blocked.sort();
+        let status = match (frontier.is_empty(), blocked.is_empty()) {
+            (false, true) => RootCriticalFrontierStatusV3::Ready,
+            (false, false) => RootCriticalFrontierStatusV3::ReadyAndBlockedOnUnevaluatedSuccessor,
+            (true, false) => RootCriticalFrontierStatusV3::BlockedOnUnevaluatedSuccessor,
+            (true, true) => RootCriticalFrontierStatusV3::Exhausted,
+        };
+        RootCriticalFrontierSnapshotV3 {
+            status,
+            tasks: frontier,
+            blocked_on_unevaluated_successor: blocked,
+        }
+    }
+
+    pub fn rebuild_root_critical_frontier_snapshot_v3(&self) -> RootCriticalFrontierSnapshotV3 {
+        self.rebuild_root_critical_frontier()
     }
 
     fn ensure_order_available(
@@ -1179,6 +1240,20 @@ mod tests {
             root_distance: distance,
             estimated_cost_bucket: 1,
         }
+    }
+
+    fn actor_slot(
+        graph_owner: &str,
+        actor: PlayerId,
+        protocol: &str,
+        stage: &str,
+        slot_id: &str,
+        order: u32,
+        distance: u16,
+    ) -> ExpansionSlotIdentityV3 {
+        let mut expansion = slot(graph_owner, protocol, stage, slot_id, order, distance);
+        expansion.actor = actor;
+        expansion
     }
 
     fn cast_prefix_progress(from_continuation_identity: &str) -> PrefixProgressAttestationV3 {
@@ -1425,9 +1500,11 @@ mod tests {
         assert_eq!(virtual_root.root_bounds(), BoundIntervalV1::UNKNOWN);
         assert!(virtual_root.certified_optimal_alternative_ids().is_empty());
         let initial_frontier = virtual_root.rebuild_root_critical_frontier();
-        assert_eq!(initial_frontier.len(), 2);
-        assert_eq!(initial_frontier, reference_frontier(&virtual_root));
+        assert_eq!(initial_frontier.status, RootCriticalFrontierStatusV3::Ready);
+        assert_eq!(initial_frontier.tasks.len(), 2);
+        assert_eq!(initial_frontier.tasks, reference_frontier(&virtual_root));
         assert!(initial_frontier
+            .tasks
             .iter()
             .any(|task| task.unresolved_prefix_support_ids == [envelope_id.clone()]));
 
@@ -1445,6 +1522,15 @@ mod tests {
                     ordered_engine_responses: pass_responses.clone(),
                     finalization_boundary: "priority-passed-to-opponent".to_owned(),
                     successor_node_id: "oracle-successor:4".to_owned(),
+                    next_expansion_slot: Some(actor_slot(
+                        "oracle-successor:4",
+                        PlayerId::P1,
+                        "priority",
+                        "post-pass",
+                        "draw",
+                        0,
+                        1,
+                    )),
                     graph_path_node_ids: vec![
                         "game:root".to_owned(),
                         "oracle-successor:4".to_owned(),
@@ -1457,7 +1543,7 @@ mod tests {
             )
             .unwrap();
         virtual_root
-            .update_successor_bounds(&pass_id, BoundIntervalV1::exact(0))
+            .update_successor_bounds(&pass_id, BoundIntervalV1::exact(0), None)
             .unwrap();
         let other_responses = vec![OTHER.to_owned()];
         virtual_root
@@ -1470,6 +1556,15 @@ mod tests {
                     ordered_engine_responses: other_responses.clone(),
                     finalization_boundary: "priority-action-complete".to_owned(),
                     successor_node_id: "oracle-successor:8".to_owned(),
+                    next_expansion_slot: Some(actor_slot(
+                        "oracle-successor:8",
+                        PlayerId::P1,
+                        "priority",
+                        "post-other",
+                        "draw",
+                        0,
+                        1,
+                    )),
                     graph_path_node_ids: vec![
                         "game:root".to_owned(),
                         "oracle-successor:8".to_owned(),
@@ -1482,7 +1577,7 @@ mod tests {
             )
             .unwrap();
         virtual_root
-            .update_successor_bounds(&other_id, BoundIntervalV1::exact(0))
+            .update_successor_bounds(&other_id, BoundIntervalV1::exact(0), None)
             .unwrap();
         assert_eq!(
             virtual_root.alternatives[&other_id].bounds,
@@ -1494,8 +1589,13 @@ mod tests {
         );
         assert!(virtual_root.certified_optimal_alternative_ids().is_empty());
         let envelope_frontier = virtual_root.rebuild_root_critical_frontier();
-        assert_eq!(envelope_frontier, reference_frontier(&virtual_root));
+        assert_eq!(
+            envelope_frontier.status,
+            RootCriticalFrontierStatusV3::Ready
+        );
+        assert_eq!(envelope_frontier.tasks, reference_frontier(&virtual_root));
         assert!(envelope_frontier
+            .tasks
             .iter()
             .any(|task| task.unresolved_prefix_support_ids == [envelope_id.clone()]));
 
@@ -1587,14 +1687,13 @@ mod tests {
             BoundIntervalV1::UNKNOWN
         );
         let targets_frontier = virtual_root.rebuild_root_critical_frontier();
-        assert_eq!(targets_frontier, reference_frontier(&virtual_root));
+        assert_eq!(targets_frontier.status, RootCriticalFrontierStatusV3::Ready);
+        assert_eq!(targets_frontier.tasks, reference_frontier(&virtual_root));
         assert!(targets_frontier
+            .tasks
             .iter()
             .all(|task| !task.unresolved_prefix_support_ids.contains(&envelope_id)));
-        assert!(targets_frontier
-            .iter()
-            .all(|task| !task.unresolved_prefix_support_ids.contains(&envelope_id)));
-        assert!(targets_frontier.iter().all(|task| {
+        assert!(targets_frontier.tasks.iter().all(|task| {
             task.root_action_support_ids
                 .iter()
                 .all(|id| id == &p0_id || id == &p1_id)
@@ -1629,6 +1728,15 @@ mod tests {
                         ordered_engine_responses: responses.clone(),
                         finalization_boundary: format!("cast-finalized:{node}"),
                         successor_node_id: node.to_owned(),
+                        next_expansion_slot: Some(actor_slot(
+                            node,
+                            next_actor.unwrap_or(PlayerId::P0),
+                            "priority",
+                            "post-cast",
+                            "resolve-next",
+                            0,
+                            1,
+                        )),
                         graph_path_node_ids: vec!["game:root".to_owned(), node.to_owned()],
                         next_actor,
                         provenance: SuccessorProvenanceV3::OracleFixture {
@@ -1643,7 +1751,7 @@ mod tests {
                 "completion alone does not create a value"
             );
             virtual_root
-                .update_successor_bounds(id, BoundIntervalV1::exact(value))
+                .update_successor_bounds(id, BoundIntervalV1::exact(value), None)
                 .unwrap();
             let oracle_action_value =
                 flat_truth.node_values[&FixtureNodeId(if value == 1 { 2 } else { 3 })];
@@ -1669,13 +1777,14 @@ mod tests {
                     "updating one target bound must not update the other target cell"
                 );
                 let frontier = virtual_root.rebuild_root_critical_frontier();
-                assert_eq!(frontier, reference_frontier(&virtual_root));
-                assert_eq!(frontier.len(), 1);
+                assert_eq!(frontier.status, RootCriticalFrontierStatusV3::Ready);
+                assert_eq!(frontier.tasks, reference_frontier(&virtual_root));
+                assert_eq!(frontier.tasks.len(), 1);
                 assert_eq!(
-                    frontier[0].root_action_support_ids.as_slice(),
+                    frontier.tasks[0].root_action_support_ids.as_slice(),
                     std::slice::from_ref(&p1_id)
                 );
-                assert!(frontier[0]
+                assert!(frontier.tasks[0]
                     .role_mask
                     .contains(RootRoleMaskV3::CHALLENGER_UPPER));
             }
@@ -1889,6 +1998,15 @@ mod tests {
                         ordered_engine_responses: responses.clone(),
                         finalization_boundary: "cast-finalized".to_owned(),
                         successor_node_id: successor.to_owned(),
+                        next_expansion_slot: Some(actor_slot(
+                            successor,
+                            PlayerId::P0,
+                            "priority",
+                            "post-cast",
+                            "continue",
+                            0,
+                            1,
+                        )),
                         graph_path_node_ids: path,
                         next_actor: Some(PlayerId::P0),
                         provenance: SuccessorProvenanceV3::OracleFixture {
@@ -1921,7 +2039,12 @@ mod tests {
         assert!(!root.root_action_domain_complete());
         assert_eq!(root.root_bounds(), BoundIntervalV1::UNKNOWN);
         assert!(root.certified_optimal_alternative_ids().is_empty());
-        assert!(root.rebuild_root_critical_frontier().is_empty());
+        let unattested = root.rebuild_root_critical_frontier();
+        assert_eq!(
+            unattested.status,
+            RootCriticalFrontierStatusV3::DomainNotAttested
+        );
+        assert!(unattested.tasks.is_empty());
         assert_eq!(
             root.attest_root_domain(PhysicalRootDomainAttestationV3 {
                 root_decision_identity: OWNER.to_owned(),
@@ -1944,17 +2067,140 @@ mod tests {
         .unwrap();
 
         let frontier = root.rebuild_root_critical_frontier();
-        assert_eq!(frontier, reference_frontier(&root));
-        assert_eq!(frontier.len(), 1, "the shared CastSpell slot appears once");
-        assert_eq!(frontier[0].slot.slot_id, CAST);
-        assert!(frontier[0].role_mask.supports_both());
-        assert_eq!(frontier[0].root_action_support_ids, [p0_id, p1_id]);
-        assert!(frontier[0].unresolved_prefix_support_ids.is_empty());
+        assert_eq!(frontier.status, RootCriticalFrontierStatusV3::Ready);
+        assert_eq!(frontier.tasks, reference_frontier(&root));
+        assert_eq!(
+            frontier.tasks.len(),
+            1,
+            "the shared CastSpell slot appears once"
+        );
+        assert_eq!(frontier.tasks[0].slot.slot_id, CAST);
+        assert!(frontier.tasks[0].role_mask.supports_both());
+        assert_eq!(frontier.tasks[0].root_action_support_ids, [p0_id, p1_id]);
+        assert!(frontier.tasks[0].unresolved_prefix_support_ids.is_empty());
         assert_eq!(root.alternatives.len(), 2);
         assert_ne!(
             root.alternatives.values().next().unwrap().bounds,
             BoundIntervalV1::exact(1),
             "an unexpanded shared prefix gives neither alternative a value"
         );
+    }
+
+    #[test]
+    fn empty_frontier_reports_critical_unevaluated_successor_instead_of_exhausted() {
+        let mut root = VirtualPhysicalRootV3::new(OWNER, PlayerId::P0).unwrap();
+        let make_candidate =
+            |order: u32, response: &str, task: ExpansionSlotIdentityV3| PhysicalRootCandidateV3 {
+                identity: PhysicalRootActionIdentityV3 {
+                    schema_version: VIRTUAL_PHYSICAL_ROOT_SCHEMA_VERSION_V3,
+                    physical_owner_id: OWNER.to_owned(),
+                    owner_actor: PlayerId::P0,
+                    stable_order: order,
+                    continuation_identity: "scheduler-states-v1".to_owned(),
+                    construction_path_identity: Vec::new(),
+                    ordered_engine_responses: vec![response.to_owned()],
+                },
+                construction_path: Vec::new(),
+                next_expansion_slot: task,
+                executed_response_prefix: Vec::new(),
+            };
+        let a_id = root
+            .insert_known_alternative(make_candidate(
+                0,
+                "A",
+                slot("game:root", "priority", "root", "A", 0, 0),
+            ))
+            .unwrap();
+        let b_id = root
+            .insert_known_alternative(make_candidate(
+                1,
+                "B",
+                slot("game:root", "priority", "root", "B", 1, 0),
+            ))
+            .unwrap();
+        let c_id = root
+            .insert_known_alternative(make_candidate(
+                2,
+                "C",
+                slot("game:root", "priority", "root", "C", 2, 0),
+            ))
+            .unwrap();
+        root.attest_root_domain(PhysicalRootDomainAttestationV3 {
+            root_decision_identity: OWNER.to_owned(),
+            root_actor: PlayerId::P0,
+            ordered_root_item_ids: vec![a_id.clone(), b_id.clone(), c_id.clone()],
+            evidence: CompleteDomainEvidenceV3::OracleFixture {
+                fixture_identity: "frontier-status-fixture".to_owned(),
+            },
+        })
+        .unwrap();
+
+        for (id, response, successor, next_slot) in [
+            (a_id.as_str(), "A", "successor:A", None),
+            (b_id.as_str(), "B", "successor:B", None),
+            (
+                c_id.as_str(),
+                "C",
+                "successor:C",
+                Some(actor_slot(
+                    "successor:C",
+                    PlayerId::P1,
+                    "priority",
+                    "response",
+                    "continue-C",
+                    0,
+                    1,
+                )),
+            ),
+        ] {
+            let responses = vec![response.to_owned()];
+            root.complete_alternative(
+                id,
+                &responses,
+                SuccessorBindingV3 {
+                    physical_owner_id: OWNER.to_owned(),
+                    owner_graph_node_id: "game:root".to_owned(),
+                    ordered_engine_responses: responses.clone(),
+                    finalization_boundary: "physical-action-complete".to_owned(),
+                    successor_node_id: successor.to_owned(),
+                    next_expansion_slot: next_slot,
+                    graph_path_node_ids: vec!["game:root".to_owned(), successor.to_owned()],
+                    next_actor: Some(PlayerId::P1),
+                    provenance: SuccessorProvenanceV3::OracleFixture {
+                        fixture_identity: "frontier-status-fixture".to_owned(),
+                    },
+                },
+            )
+            .unwrap();
+        }
+        root.update_successor_bounds(&a_id, BoundIntervalV1::exact(0), None)
+            .unwrap();
+        root.update_successor_bounds(&b_id, BoundIntervalV1::UNKNOWN, None)
+            .unwrap();
+        root.update_successor_bounds(
+            &c_id,
+            BoundIntervalV1::UNKNOWN,
+            Some(actor_slot(
+                "successor:C",
+                PlayerId::P1,
+                "priority",
+                "response",
+                "continue-C",
+                0,
+                1,
+            )),
+        )
+        .unwrap();
+
+        let snapshot = root.rebuild_root_critical_frontier();
+        assert_eq!(snapshot.tasks, reference_frontier(&root));
+        assert!(snapshot.tasks.is_empty());
+        assert_eq!(
+            snapshot.status,
+            RootCriticalFrontierStatusV3::BlockedOnUnevaluatedSuccessor
+        );
+        assert_eq!(snapshot.blocked_on_unevaluated_successor, [b_id]);
+        assert_eq!(root.root_bounds(), BoundIntervalV1 { lower: 0, upper: 1 });
+        assert!(root.certified_optimal_alternative_ids().is_empty());
     }
 }
