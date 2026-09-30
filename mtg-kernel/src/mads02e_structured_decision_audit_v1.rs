@@ -763,9 +763,17 @@ fn dynamic_v2_tracks_complete_lightning_bolt_root_responses_without_certifying_c
         .complete_root_actions
         .iter()
         .any(|action| { action.identity.ordered_engine_responses == [Action::CastSpell(bolt)] }));
-    let (construction_path, target_decision, target_candidates) = search
-        .debug_construction_candidates_v2(&Action::CastSpell(bolt))
-        .expect("CastSpell must enter a typed PendingCast construction node");
+    let target_candidates = after_announcement
+        .incomplete_root_frontier
+        .iter()
+        .filter(|frontier| {
+            frontier.ordered_engine_responses.first() == Some(&Action::CastSpell(bolt))
+        })
+        .filter_map(|frontier| frontier.ordered_engine_responses.last().cloned())
+        .collect::<Vec<_>>();
+    let mut post_cast_state = root.clone();
+    engine::step(&mut post_cast_state, Action::CastSpell(bolt)).unwrap();
+    let target_decision = engine::advance_until_decision(&mut post_cast_state);
     let Decision::ChooseTargets {
         player: target_actor,
         spell,
@@ -786,7 +794,7 @@ fn dynamic_v2_tracks_complete_lightning_bolt_root_responses_without_certifying_c
     assert_eq!(expected_targets, target_candidates);
     let v5_targets = legal_action_candidates_v5(
         &PolicyDecisionV5::Surface(SurfaceDecision::Decision(target_decision.clone())),
-        &root,
+        &post_cast_state,
     )
     .unwrap()
     .into_iter()
@@ -796,21 +804,26 @@ fn dynamic_v2_tracks_complete_lightning_bolt_root_responses_without_certifying_c
     })
     .collect::<Vec<_>>();
     assert_eq!(target_candidates, v5_targets);
-    let after_scheduled_target = search.run_v2(1);
-    assert_eq!(after_scheduled_target.metrics.expanded_actions, 2);
-    assert_eq!(after_scheduled_target.complete_root_actions.len(), 1);
-    assert!(after_scheduled_target.certified_optimal_actions.is_empty());
-    let scheduled_responses = &after_scheduled_target.complete_root_actions[0]
-        .identity
-        .ordered_engine_responses;
-    let scheduled_target = scheduled_responses.last().unwrap().clone();
-    assert!(target_candidates.contains(&scheduled_target));
-    let target_left_for_test = target_candidates
+    let after_second_root_response = search.run_v2(1);
+    assert_eq!(after_second_root_response.metrics.expanded_actions, 2);
+    assert!(after_second_root_response
+        .certified_optimal_actions
+        .is_empty());
+    assert!(after_second_root_response
+        .complete_root_actions
         .iter()
-        .find(|candidate| *candidate != &scheduled_target)
-        .expect("Lightning Bolt has a distinct other legal target")
-        .clone();
-
+        .any(|action| action.identity.ordered_engine_responses == [Action::Pass]));
+    assert_eq!(
+        after_second_root_response
+            .incomplete_root_frontier
+            .iter()
+            .filter(|frontier| {
+                frontier.ordered_engine_responses.first() == Some(&Action::CastSpell(bolt))
+            })
+            .count(),
+        target_candidates.len(),
+        "the public scheduler retains each target as an open construction branch"
+    );
     for candidate in &target_candidates {
         let mut branch = root.clone();
         engine::step(&mut branch, Action::CastSpell(bolt)).unwrap();
@@ -833,14 +846,12 @@ fn dynamic_v2_tracks_complete_lightning_bolt_root_responses_without_certifying_c
         assert_eq!(branch.stack.last().unwrap().targets, [target]);
         assert!(branch.objects.get(bolt).v4.finalized_cast_binding.is_some());
     }
-    search
-        .debug_expand_construction_action_v2(&construction_path, &target_left_for_test)
-        .expect("the remaining target branch finalizes through the dynamic V2 transition");
-
-    search
-        .debug_expand_root_engine_action_v2(&Action::Pass)
-        .expect("Pass is a complete physical root response with an opponent priority successor");
-    let result = search.debug_result_v2(DynamicSearchStatusV1::UnresolvedWithinBudget);
+    let result = search.run_v2(8);
+    assert_eq!(
+        result.status,
+        DynamicSearchStatusV1::UnresolvedWithinBudget,
+        "the public scheduler must enumerate the admitted domain without inventing a value"
+    );
     assert_eq!(result.root_bounds, crate::mads_v1::BoundIntervalV1::UNKNOWN);
     assert_eq!(result.exact_root_value, None);
     assert!(result.root_action_domain_complete);
@@ -903,7 +914,7 @@ fn dynamic_v2_tracks_complete_lightning_bolt_root_responses_without_certifying_c
 }
 #[test]
 fn dynamic_v2_fails_closed_for_out_of_scope_fireblast_construction() {
-    use crate::dynamic_engine_search_v1::{DynamicEngineSearchV2, DynamicSearchStatusV1};
+    use crate::dynamic_engine_search_v1::{DynamicEngineSearchV2, DynamicSearchErrorV1};
 
     let mut root = protocol_empty_state(0x03b2_0002);
     root.step = Step::Main1;
@@ -921,18 +932,11 @@ fn dynamic_v2_fails_closed_for_out_of_scope_fireblast_construction() {
             if castable_spells.contains(&fireblast)
     ));
 
-    let mut search = DynamicEngineSearchV2::new(&root, root_decision).unwrap();
     assert_eq!(
-        search.debug_expand_root_engine_action_v2(&Action::CastSpell(fireblast)),
-        Err(DynamicSearchStatusV1::UnsupportedDecision),
-        "Fireblast's mode/payment protocol is outside this V2 admission scope"
+        DynamicEngineSearchV2::new(&root, root_decision).err(),
+        Some(DynamicSearchErrorV1::UnsupportedDecision),
+        "V2 must reject the entire root domain if it includes out-of-scope construction"
     );
-    let result = search.debug_result_v2(DynamicSearchStatusV1::UnsupportedDecision);
-    assert_eq!(result.root_bounds, crate::mads_v1::BoundIntervalV1::UNKNOWN);
-    assert_eq!(result.exact_root_value, None);
-    assert!(result.certified_optimal_actions.is_empty());
-    assert!(result.complete_root_actions.is_empty());
-    assert!(!result.root_action_domain_complete);
     assert_eq!(
         root, root_before,
         "unsupported construction must preserve caller state"

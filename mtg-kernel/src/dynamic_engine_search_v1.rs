@@ -640,82 +640,55 @@ impl DynamicEngineSearchV2 {
         root_decision: Decision,
     ) -> Result<Self, DynamicSearchErrorV1> {
         let inner = DynamicEngineSearchV1::new(root_state, root_decision.clone())?;
+        let bolt_card = crate::card_def::card_id_by_name("Lightning Bolt")
+            .ok_or(DynamicSearchErrorV1::UnsupportedDecision)?;
+        let root = &inner.nodes[inner.root];
+        let root_cast_spell = root
+            .slots
+            .iter()
+            .find_map(|slot| match &slot.action {
+                Action::CastSpell(spell) => Some(*spell),
+                _ => None,
+            })
+            .ok_or(DynamicSearchErrorV1::UnsupportedDecision)?;
+        let bolt = root_cast_spell;
+        let admitted_root = matches!(
+            &root_decision,
+            Decision::CastSpellOrPass {
+                castable_spells,
+                mana_abilities,
+                land_drops,
+                activatable_abilities,
+                plot_actions,
+                ..
+            } if castable_spells.as_slice() == [bolt]
+                && mana_abilities.is_empty()
+                && land_drops.is_empty()
+                && activatable_abilities.is_empty()
+                && plot_actions.is_empty()
+        ) && root.state.objects.get(bolt).card_def == bolt_card
+            && root.slots.len() == 2
+            && root
+                .slots
+                .iter()
+                .any(|slot| slot.action == Action::CastSpell(bolt))
+            && root.slots.iter().any(|slot| slot.action == Action::Pass);
+        if !admitted_root {
+            return Err(DynamicSearchErrorV1::UnsupportedDecision);
+        }
         Ok(Self {
             inner,
             initiating_decision: root_decision,
         })
     }
-
-    #[cfg(test)]
-    pub(crate) fn debug_expand_root_engine_action_v2(
-        &mut self,
-        action: &Action,
-    ) -> Result<(), DynamicSearchStatusV1> {
-        let Some(slot) = self.inner.nodes[self.inner.root]
-            .slots
-            .iter()
-            .position(|slot| &slot.action == action && slot.child.is_none())
-        else {
-            return Err(DynamicSearchStatusV1::UnresolvedWithinBudget);
-        };
-        self.expand_slot_v2(self.inner.root, slot)
-    }
-    #[cfg(test)]
-    pub(crate) fn debug_construction_candidates_v2(
-        &self,
-        root_action: &Action,
-    ) -> Option<(Vec<u32>, Decision, Vec<Action>)> {
-        let root_slot = self.inner.nodes[self.inner.root]
-            .slots
-            .iter()
-            .find(|slot| &slot.action == root_action)?;
-        let node = self.inner.nodes.get(root_slot.child?)?;
-        node.construction_context.as_ref()?;
-        Some((
-            node.semantic_path.clone(),
-            node.decision.clone(),
-            node.slots.iter().map(|slot| slot.action.clone()).collect(),
-        ))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_expand_construction_action_v2(
-        &mut self,
-        owner_path: &[u32],
-        action: &Action,
-    ) -> Result<(), DynamicSearchStatusV1> {
-        let Some((owner, slot)) = self
-            .inner
-            .nodes
-            .iter()
-            .enumerate()
-            .find_map(|(owner, node)| {
-                if node.semantic_path != owner_path || node.construction_context.is_none() {
-                    return None;
-                }
-                node.slots
-                    .iter()
-                    .position(|slot| &slot.action == action && slot.child.is_none())
-                    .map(|slot| (owner, slot))
-            })
-        else {
-            return Err(DynamicSearchStatusV1::UnresolvedWithinBudget);
-        };
-        self.expand_slot_v2(owner, slot)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_result_v2(&self, status: DynamicSearchStatusV1) -> DynamicSearchResultV2 {
-        self.result_v2(status)
-    }
     pub fn run_v2(&mut self, compute_budget: usize) -> DynamicSearchResultV2 {
         let mut expanded = 0usize;
         while expanded < compute_budget {
-            if !self.certified_complete_actions_v2().is_empty() {
+            if self.complete_and_incomplete_root_actions_v2().1.is_empty() {
                 break;
             }
             self.inner.metrics.scheduler_rebuilds += 1;
-            let Some((owner, slot)) = self.inner.next_task() else {
+            let Some((owner, slot)) = self.next_root_completion_task_v2() else {
                 break;
             };
             if let Err(status) = self.expand_slot_v2(owner, slot) {
@@ -729,6 +702,29 @@ impl DynamicEngineSearchV2 {
             DynamicSearchStatusV1::Certified
         };
         self.result_v2(status)
+    }
+
+    // V2 currently admits one physical root response only. First enumerate all
+    // root actions, then all admitted construction candidates; do not spend a
+    // construction budget exploring later game decisions under an unsupported
+    // response contract. Bounds therefore remain conservative/UNKNOWN.
+    fn next_root_completion_task_v2(&self) -> Option<(usize, usize)> {
+        let root = &self.inner.nodes[self.inner.root];
+        if let Some(slot) = root.slots.iter().position(|slot| slot.child.is_none()) {
+            return Some((self.inner.root, slot));
+        }
+        for root_slot in &root.slots {
+            let Some(child) = root_slot.child else {
+                continue;
+            };
+            let node = &self.inner.nodes[child];
+            if node.construction_context.is_some() {
+                if let Some(slot) = node.slots.iter().position(|slot| slot.child.is_none()) {
+                    return Some((child, slot));
+                }
+            }
+        }
+        None
     }
 
     fn expand_slot_v2(
@@ -844,7 +840,9 @@ impl DynamicEngineSearchV2 {
             return;
         }
 
-        let Some(finalization_boundary) = finalization_boundary_v2(node, &responses) else {
+        let Some(finalization_boundary) =
+            finalization_boundary_v2(node, &responses, &self.initiating_decision)
+        else {
             incomplete.push(IncompletePhysicalActionFrontierV2 {
                 stable_prefix_identity: stable_action_path_id_v2("unfinalized", &path_ids),
                 owner_semantic_path: node.semantic_path.clone(),
@@ -926,6 +924,7 @@ fn stable_action_path_id_v2(kind: &str, path: &[String]) -> String {
 fn finalization_boundary_v2(
     node: &Node,
     responses: &[Action],
+    initiating_decision: &Decision,
 ) -> Option<PhysicalActionFinalizationV2> {
     if let Decision::GameOver { winner } = node.decision {
         return Some(PhysicalActionFinalizationV2::Terminal { winner });
@@ -933,10 +932,7 @@ fn finalization_boundary_v2(
     if node.state.engine.pending_cast.is_some() || node.state.engine.pending_activation.is_some() {
         return None;
     }
-    if let Some(spell) = responses.iter().find_map(|action| match action {
-        Action::CastSpell(spell) => Some(*spell),
-        _ => None,
-    }) {
+    if let [Action::CastSpell(spell), Action::ChooseTarget(_)] = responses {
         let selected_targets = responses
             .iter()
             .filter_map(|action| match action {
@@ -944,24 +940,34 @@ fn finalization_boundary_v2(
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if !is_supported_constructed_spell_v2(&node.state, spell) {
+        if !is_supported_constructed_spell_v2(&node.state, *spell) {
             return None;
         }
-        let finalized_binding = node.state.objects.get(spell).v4.finalized_cast_binding?;
+        let finalized_binding = node.state.objects.get(*spell).v4.finalized_cast_binding?;
         let item = node
             .state
             .stack
             .iter()
             .rev()
-            .find(|item| item.source == spell && !item.is_copy)?;
+            .find(|item| item.source == *spell && !item.is_copy)?;
         if item.targets != selected_targets {
             return None;
         }
         return Some(PhysicalActionFinalizationV2::CastFinalized {
-            source: spell,
+            source: *spell,
             stack_item: Box::new(item.clone()),
             finalized_binding,
         });
+    }
+    if responses != [Action::Pass] {
+        return None;
+    }
+    let initiating_actor = actor(initiating_decision)?;
+    if !matches!(
+        &node.decision,
+        Decision::CastSpellOrPass { player, .. } if *player != initiating_actor
+    ) {
+        return None;
     }
     Some(PhysicalActionFinalizationV2::EngineDecisionReached(
         node.decision.clone(),
