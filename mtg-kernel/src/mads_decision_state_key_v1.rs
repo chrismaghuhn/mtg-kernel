@@ -297,4 +297,34 @@ mod tests {
         paired.session.environment_revision += 1;
         assert!(!base.exactly_matches(&paired));
     }
+
+    #[test]
+    fn exact_contract_sensitivity_covers_hidden_rng_history_and_continuation_stage() {
+        let base = key();
+
+        let mut hidden_library = base.clone();
+        hidden_library.game_state.players[PlayerId::P1.index()]
+            .library
+            .swap(0, 1);
+        assert!(!base.exactly_matches(&hidden_library));
+
+        let mut different_rng = base.clone();
+        different_rng.game_state =
+            GameState::new_from_libraries(&[1, 2], &[3, 4], |id| format!("card-{id}"), 100);
+        assert!(!base.exactly_matches(&different_rng));
+
+        let mut different_history = base.clone();
+        different_history.game_state.engine.event_history.push(
+            crate::event::CommittedEvent::Damage {
+                source: ObjectId(0),
+                target: crate::state::Target::Player(PlayerId::P0),
+                amount: 1,
+            },
+        );
+        assert!(!base.exactly_matches(&different_history));
+
+        let mut different_stage = base.clone();
+        different_stage.construction.as_mut().unwrap().protocol = "choose-cast-mode".into();
+        assert!(!base.exactly_matches(&different_stage));
+    }
 }
