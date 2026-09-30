@@ -912,6 +912,316 @@ fn dynamic_v2_tracks_complete_lightning_bolt_root_responses_without_certifying_c
         "search owns state clones and leaves caller root unchanged"
     );
 }
+
+#[test]
+fn mads03b5_public_v3_binds_authoritative_bolt_target_and_pass_responses() {
+    use crate::dynamic_engine_search_v1::{DynamicEngineSearchV2, DynamicSearchStatusV1};
+    use crate::mads03b5_engine_binding_v3::{DynamicEngineSearchV3, EngineBindingErrorV3};
+    use crate::mads_virtual_physical_root_v3::{
+        PhysicalAlternativeStateV3, RootCriticalFrontierStatusV3,
+    };
+
+    let mut root = protocol_empty_state(0x03b5_0001);
+    root.turn = 1;
+    root.step = Step::Main1;
+    root.active_player = PlayerId::P0;
+    root.priority_player = PlayerId::P0;
+    root.players[PlayerId::P0.index()].mana_pool[3] = 1;
+    let bolt = fixture_object(&mut root, PlayerId::P0, "Lightning Bolt", Zone::Hand);
+    let root_before = root.clone();
+    let root_decision = engine::advance_until_decision(&mut root);
+
+    let mut stale_decision = root_decision.clone();
+    let Decision::CastSpellOrPass {
+        castable_spells, ..
+    } = &mut stale_decision
+    else {
+        unreachable!()
+    };
+    castable_spells.clear();
+    assert_eq!(
+        DynamicEngineSearchV3::new(&root, stale_decision).err(),
+        Some(EngineBindingErrorV3::InvalidOrStaleRootFrame),
+        "a foreign root decision cannot be admitted"
+    );
+
+    let mut v3 = DynamicEngineSearchV3::new(&root, root_decision.clone()).unwrap();
+    let budget0 = v3.run_v3(0).unwrap();
+    assert_eq!(
+        budget0.root_bounds,
+        crate::mads_v1::BoundIntervalV1::UNKNOWN
+    );
+    assert!(budget0.certified_optimal_actions.is_empty());
+    assert_eq!(budget0.metrics.authoritative_transitions, 0);
+    assert_eq!(budget0.open_construction_envelopes.len(), 1);
+    assert!(budget0
+        .physical_alternatives
+        .iter()
+        .all(|a| a.state == PhysicalAlternativeStateV3::KnownCompleteAlternativeNotExpanded));
+    let cast_id =
+        crate::mads03b5_engine_binding_v3::engine_action_identity_v3(&Action::CastSpell(bolt))
+            .unwrap();
+    let pass_id =
+        crate::mads03b5_engine_binding_v3::engine_action_identity_v3(&Action::Pass).unwrap();
+    let budget0_slot_ids = budget0
+        .frontier
+        .tasks
+        .iter()
+        .map(|task| task.slot.slot_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        budget0_slot_ids,
+        [cast_id, pass_id.clone()].into_iter().collect()
+    );
+
+    let budget1 = v3.run_v3(1).unwrap();
+    assert_eq!(budget1.metrics.authoritative_transitions, 1);
+    assert_eq!(
+        budget1.open_construction_envelopes.len(),
+        0,
+        "the target frame was fully admitted atomically"
+    );
+    assert_eq!(budget1.physical_alternatives.len(), 3);
+    assert!(budget1
+        .physical_alternatives
+        .iter()
+        .all(|a| a.state != PhysicalAlternativeStateV3::Completed));
+    assert!(budget1.certified_optimal_actions.is_empty());
+    assert!(budget1
+        .physical_alternatives
+        .iter()
+        .all(|alternative| alternative.next_expansion_slot.is_some()));
+    let target_alternative_ids = budget1
+        .physical_alternatives
+        .iter()
+        .filter(|alternative| {
+            alternative.ordered_engine_responses.first() == Some(&Action::CastSpell(bolt))
+        })
+        .map(|alternative| alternative.stable_identity.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let frontier_target_support = budget1
+        .frontier
+        .tasks
+        .iter()
+        .flat_map(|task| task.root_action_support_ids.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        frontier_target_support, target_alternative_ids,
+        "real target ExpansionSlots carry separate virtual root support identities"
+    );
+    assert!(budget1
+        .physical_alternatives
+        .iter()
+        .any(
+            |alternative| alternative.ordered_engine_responses == [Action::Pass]
+                && alternative
+                    .next_expansion_slot
+                    .as_ref()
+                    .is_some_and(|slot| slot.slot_id == pass_id)
+        ));
+
+    let budget2 = v3.run_v3(1).unwrap();
+    assert_eq!(budget2.metrics.authoritative_transitions, 2);
+    assert_eq!(
+        budget2.metrics.complete_physical_alternatives, 1,
+        "only Pass is finalized after two work units"
+    );
+    assert!(budget2.certified_optimal_actions.is_empty());
+
+    let result = v3.run_v3(8).unwrap();
+    assert!(result.root_domain_complete);
+    assert_eq!(result.root_bounds, crate::mads_v1::BoundIntervalV1::UNKNOWN);
+    assert_eq!(result.exact_root_value, None);
+    assert!(result.certified_optimal_actions.is_empty());
+    assert_eq!(result.metrics.authoritative_transitions, 6);
+    assert_eq!(result.metrics.state_clones, 13);
+    assert_eq!(result.metrics.candidate_count, 11);
+    assert_eq!(result.metrics.complete_physical_alternatives, 3);
+    assert_eq!(result.metrics.successor_bindings, 3);
+    assert_eq!(result.metrics.frontier_rebuilds, 4);
+    assert_eq!(result.metrics.unknown_root_actions, 3);
+    assert_eq!(
+        result.frontier.status,
+        RootCriticalFrontierStatusV3::BlockedOnUnevaluatedSuccessor
+    );
+    assert_eq!(result.physical_alternatives.len(), 3);
+    assert_eq!(
+        result.raw_root_actions,
+        [Action::CastSpell(bolt), Action::Pass]
+    );
+    assert!(result
+        .physical_alternatives
+        .iter()
+        .all(|a| a.bounds == crate::mads_v1::BoundIntervalV1::UNKNOWN));
+
+    let mut identities = std::collections::BTreeSet::new();
+    let mut semantic_paths = result.physical_alternatives.iter().map(|a| {
+        assert!(identities.insert(a.stable_identity.clone()));
+        assert_eq!(a.state, PhysicalAlternativeStateV3::Completed);
+        let binding = a.successor_binding.as_ref().expect("completed response is bound to a real successor");
+        match &binding.provenance {
+            crate::mads_virtual_physical_root_v3::SuccessorProvenanceV3::AuthoritativeTransition { source_frame_identity, transition_identity, transition_response_identity, physical_response_identity, successor_frame_identity } => {
+                assert_eq!(source_frame_identity, &a.admission_evidence_identity);
+                assert!(!transition_identity.is_empty());
+                assert_eq!(successor_frame_identity, &binding.successor_node_id);
+                assert_eq!(physical_response_identity, &a.stable_identity);
+                assert_eq!(
+                    Some(transition_response_identity),
+                    a.ordered_engine_responses
+                        .last()
+                        .and_then(crate::mads03b5_engine_binding_v3::engine_action_identity_v3)
+                        .as_ref()
+                );
+            }
+            _ => panic!("engine adapter must emit authoritative transition provenance"),
+        }
+        assert_eq!(binding.ordered_engine_responses, a.ordered_engine_responses.iter().map(|action| crate::mads03b5_engine_binding_v3::engine_action_identity_v3(action).unwrap()).collect::<Vec<_>>());
+        a.ordered_engine_responses
+            .iter()
+            .map(|action| format!("{action:?}"))
+            .collect::<Vec<_>>()
+            .join("+")
+    }).collect::<Vec<_>>();
+    semantic_paths.sort();
+    let mut expected_paths = vec![
+        vec![
+            Action::CastSpell(bolt),
+            Action::ChooseTarget(Target::Player(PlayerId::P0)),
+        ],
+        vec![
+            Action::CastSpell(bolt),
+            Action::ChooseTarget(Target::Player(PlayerId::P1)),
+        ],
+        vec![Action::Pass],
+    ]
+    .into_iter()
+    .map(|path| {
+        path.iter()
+            .map(|action| format!("{action:?}"))
+            .collect::<Vec<_>>()
+            .join("+")
+    })
+    .collect::<Vec<_>>();
+    expected_paths.sort();
+    assert_eq!(semantic_paths, expected_paths);
+    for alternative in &result.physical_alternatives {
+        if alternative.ordered_engine_responses.first() == Some(&Action::CastSpell(bolt)) {
+            let binding = alternative.successor_binding.as_ref().unwrap();
+            let target = match alternative.ordered_engine_responses[1] {
+                Action::ChooseTarget(target) => target,
+                _ => unreachable!(),
+            };
+            assert!(binding.finalization_boundary.contains(&match target {
+                Target::Player(p) => format!("player:{}", p.index()),
+                Target::Object(o) => format!("object:{}", o.0),
+            }));
+            assert_eq!(binding.next_actor, Some(PlayerId::P0));
+        } else {
+            assert_eq!(alternative.ordered_engine_responses, [Action::Pass]);
+            assert_eq!(
+                alternative.successor_binding.as_ref().unwrap().next_actor,
+                Some(PlayerId::P1)
+            );
+        }
+    }
+
+    let mut v2 = DynamicEngineSearchV2::new(&root, root_decision.clone()).unwrap();
+    let v2_result = v2.run_v2(8);
+    assert_eq!(
+        v2_result.status,
+        DynamicSearchStatusV1::UnresolvedWithinBudget
+    );
+    let normalize = |paths: Vec<Vec<Action>>| {
+        let mut keys = paths
+            .into_iter()
+            .map(|path| {
+                path.iter()
+                    .map(|a| format!("{a:?}"))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            })
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        normalize(
+            v2_result
+                .complete_root_actions
+                .iter()
+                .map(|a| a.identity.ordered_engine_responses.clone())
+                .collect()
+        ),
+        semantic_paths,
+        "V2 and V3 expose the same typed complete physical response domain"
+    );
+    let mut repeated = DynamicEngineSearchV3::new(&root, root_decision).unwrap();
+    let repeated_result = repeated.run_v3(8).unwrap();
+    let normalize_v3 = |items: &[crate::mads03b5_engine_binding_v3::PhysicalResponseV3]| {
+        let mut keys = items
+            .iter()
+            .map(|item| {
+                item.ordered_engine_responses
+                    .iter()
+                    .map(|action| format!("{action:?}"))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            })
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        normalize_v3(&repeated_result.physical_alternatives),
+        normalize_v3(&result.physical_alternatives)
+    );
+    assert_eq!(
+        repeated_result.metrics.authoritative_transitions,
+        result.metrics.authoritative_transitions
+    );
+    assert_eq!(
+        repeated_result.metrics.state_clones,
+        result.metrics.state_clones
+    );
+    assert_ne!(
+        repeated_result.physical_alternatives[0].stable_identity,
+        result.physical_alternatives[0].stable_identity,
+        "run-local provenance identities are deliberately not global reusable state keys"
+    );
+    assert_eq!(
+        root, root_before,
+        "all authoritative transitions run on private clones"
+    );
+    let resumed_after_completion = v3.run_v3(8).unwrap();
+    assert_eq!(
+        resumed_after_completion.metrics.authoritative_transitions, 6,
+        "an already completed response is not transitioned twice on a resumed run"
+    );
+    assert_eq!(resumed_after_completion.metrics.state_clones, 13);
+    assert_eq!(resumed_after_completion.metrics.frontier_rebuilds, 5);
+}
+
+#[test]
+fn mads03b5_rejects_the_entire_unsupported_fireblast_root_domain() {
+    use crate::mads03b5_engine_binding_v3::{DynamicEngineSearchV3, EngineBindingErrorV3};
+
+    let mut root = protocol_empty_state(0x03b5_0002);
+    root.step = Step::Main1;
+    root.active_player = PlayerId::P0;
+    root.priority_player = PlayerId::P0;
+    for _ in 0..6 {
+        fixture_object(&mut root, PlayerId::P0, "Mountain", Zone::Battlefield);
+    }
+    fixture_object(&mut root, PlayerId::P0, "Fireblast", Zone::Hand);
+    let before = root.clone();
+    let decision = engine::advance_until_decision(&mut root);
+    assert_eq!(
+        DynamicEngineSearchV3::new(&root, decision).err(),
+        Some(EngineBindingErrorV3::UnsupportedRootDomain),
+        "V3 rejects the whole domain when its cast protocol is outside admission"
+    );
+    assert_eq!(root, before);
+}
 #[test]
 fn dynamic_v2_fails_closed_for_out_of_scope_fireblast_construction() {
     use crate::dynamic_engine_search_v1::{DynamicEngineSearchV2, DynamicSearchErrorV1};
