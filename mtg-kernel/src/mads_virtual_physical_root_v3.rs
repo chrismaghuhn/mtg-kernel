@@ -881,9 +881,15 @@ impl VirtualPhysicalRootV3 {
         if alternative.successor_binding.is_none() {
             return Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding);
         }
+        let successor_binding = alternative
+            .successor_binding
+            .as_ref()
+            .ok_or(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding)?;
         if next_expansion_slot.as_ref().is_some_and(|slot| {
             slot.validate(&alternative.identity.physical_owner_id, slot.actor)
                 .is_err()
+                || slot.graph_owner_id != successor_binding.successor_node_id
+                || successor_binding.next_actor != Some(slot.actor)
         }) {
             return Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding);
         }
@@ -2022,6 +2028,91 @@ mod tests {
                 "failed bindings are atomic"
             );
         }
+    }
+
+    #[test]
+    fn successor_bound_update_rejects_wrong_successor_node_and_actor_atomically() {
+        let (mut root, _, _, initial_envelope_id) = root_with_prefix();
+        let envelope_id = root
+            .advance_unresolved_prefix(
+                &initial_envelope_id,
+                vec![CAST.to_owned()],
+                slot(
+                    "construction:bolt:target-stage-0",
+                    PROTOCOL,
+                    "target-pick-stage-0",
+                    "enumerate-complete-target-domain",
+                    0,
+                    1,
+                ),
+                cast_prefix_progress(ROOT_CONTINUATION),
+            )
+            .unwrap();
+        let p0_id = root
+            .admit_complete_domain(&envelope_id, oracle_domain())
+            .unwrap()[0]
+            .clone();
+        let responses = vec![CAST.to_owned(), TARGET_P0.to_owned()];
+        let expected_task = actor_slot(
+            "oracle-successor:2",
+            PlayerId::P0,
+            "priority",
+            "post-cast",
+            "continue",
+            0,
+            1,
+        );
+        root.complete_alternative(
+            &p0_id,
+            &responses,
+            SuccessorBindingV3 {
+                physical_owner_id: OWNER.to_owned(),
+                owner_graph_node_id: "game:root".to_owned(),
+                ordered_engine_responses: responses.clone(),
+                finalization_boundary: "cast-finalized".to_owned(),
+                successor_node_id: "oracle-successor:2".to_owned(),
+                next_expansion_slot: Some(expected_task.clone()),
+                graph_path_node_ids: vec!["game:root".to_owned(), "oracle-successor:2".to_owned()],
+                next_actor: Some(PlayerId::P0),
+                provenance: SuccessorProvenanceV3::OracleFixture {
+                    fixture_identity: "mads03b4-flat-physical-root-v1".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+
+        let wrong_node_task = actor_slot(
+            "other-successor-node",
+            PlayerId::P0,
+            "priority",
+            "post-cast",
+            "continue",
+            0,
+            1,
+        );
+        assert_eq!(
+            root.update_successor_bounds(&p0_id, BoundIntervalV1::exact(0), Some(wrong_node_task)),
+            Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding)
+        );
+
+        let wrong_actor_task = actor_slot(
+            "oracle-successor:2",
+            PlayerId::P1,
+            "priority",
+            "post-cast",
+            "continue",
+            0,
+            1,
+        );
+        assert_eq!(
+            root.update_successor_bounds(&p0_id, BoundIntervalV1::exact(0), Some(wrong_actor_task)),
+            Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding)
+        );
+
+        let alternative = &root.alternatives[&p0_id];
+        assert_eq!(alternative.state, PhysicalAlternativeStateV3::Completed);
+        assert_eq!(alternative.bounds, BoundIntervalV1::UNKNOWN);
+        assert_eq!(alternative.next_expansion_slot, Some(expected_task));
     }
 
     #[test]
