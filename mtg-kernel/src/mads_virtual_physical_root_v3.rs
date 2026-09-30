@@ -161,6 +161,7 @@ impl SuccessorBindingV3 {
     fn validate_for(
         &self,
         identity: &PhysicalRootActionIdentityV3,
+        admission_evidence_identity: &str,
     ) -> Result<(), VirtualPhysicalRootErrorV3> {
         let provenance_identity = match &self.provenance {
             SuccessorProvenanceV3::AuthoritativeTransition {
@@ -183,6 +184,7 @@ impl SuccessorBindingV3 {
                 .len()
                 != self.graph_path_node_ids.len()
             || provenance_identity.is_empty()
+            || provenance_identity != admission_evidence_identity
         {
             return Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding);
         }
@@ -260,6 +262,33 @@ impl PhysicalRootCandidateV3 {
 pub enum CompleteDomainEvidenceV3 {
     AuthoritativeEngineFrame { frame_identity: String },
     OracleFixture { fixture_identity: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrefixProgressProvenanceV3 {
+    AuthoritativeTransition { transition_identity: String },
+    OracleFixture { fixture_identity: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixProgressAttestationV3 {
+    pub physical_owner_id: String,
+    pub actor: PlayerId,
+    pub from_continuation_identity: String,
+    pub to_continuation_identity: String,
+    pub applied_responses: Vec<String>,
+    pub provenance: PrefixProgressProvenanceV3,
+}
+
+impl PrefixProgressAttestationV3 {
+    fn provenance_identity(&self) -> &str {
+        match &self.provenance {
+            PrefixProgressProvenanceV3::AuthoritativeTransition {
+                transition_identity,
+            } => transition_identity,
+            PrefixProgressProvenanceV3::OracleFixture { fixture_identity } => fixture_identity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,6 +461,7 @@ impl UnresolvedConstructionEnvelopeV3 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalRootAlternativeV3 {
     pub identity: PhysicalRootActionIdentityV3,
+    pub admission_evidence_identity: String,
     pub construction_path: Vec<ConstructionSlotIdentityV3>,
     pub state: PhysicalAlternativeStateV3,
     pub executed_response_prefix: Vec<String>,
@@ -568,6 +598,12 @@ impl VirtualPhysicalRootV3 {
         if expected.is_empty() || expected != attestation.ordered_root_item_ids {
             return Err(VirtualPhysicalRootErrorV3::IncompleteCandidateAttestation);
         }
+        let evidence_identity = attestation.evidence.identity().to_owned();
+        for alternative in self.alternatives.values_mut() {
+            if alternative.admission_evidence_identity.is_empty() {
+                alternative.admission_evidence_identity = evidence_identity.clone();
+            }
+        }
         self.root_domain_attestation = Some(attestation);
         Ok(())
     }
@@ -605,7 +641,7 @@ impl VirtualPhysicalRootV3 {
         }
         self.ensure_order_available(candidate.identity.stable_order, None)?;
         self.root_domain_attestation = None;
-        self.insert_candidate(candidate, Vec::new())
+        self.insert_candidate(candidate, Vec::new(), String::new())
     }
 
     pub fn advance_unresolved_prefix(
@@ -613,6 +649,7 @@ impl VirtualPhysicalRootV3 {
         envelope_id: &str,
         executed_prefix: Vec<String>,
         next_expansion_slot: ExpansionSlotIdentityV3,
+        progress: PrefixProgressAttestationV3,
     ) -> Result<String, VirtualPhysicalRootErrorV3> {
         let mut envelope = self
             .envelopes
@@ -622,6 +659,13 @@ impl VirtualPhysicalRootV3 {
         if executed_prefix.len() <= envelope.known_prefix.len()
             || executed_prefix[..envelope.known_prefix.len()] != envelope.known_prefix
             || executed_prefix.iter().any(String::is_empty)
+            || progress.physical_owner_id != envelope.physical_owner_id
+            || progress.actor != envelope.owner_actor
+            || progress.from_continuation_identity != envelope.continuation_identity
+            || progress.to_continuation_identity.is_empty()
+            || progress.applied_responses.is_empty()
+            || progress.applied_responses != executed_prefix[envelope.known_prefix.len()..]
+            || progress.provenance_identity().is_empty()
         {
             return Err(VirtualPhysicalRootErrorV3::InvalidProgress);
         }
@@ -630,6 +674,7 @@ impl VirtualPhysicalRootV3 {
             return Err(VirtualPhysicalRootErrorV3::DomainDoesNotMatchEnvelope);
         }
         envelope.known_prefix = executed_prefix;
+        envelope.continuation_identity = progress.to_continuation_identity;
         envelope.next_expansion_slot = next_expansion_slot;
         let next_id = envelope.stable_prefix_id();
         if next_id != envelope_id && self.envelopes.contains_key(&next_id) {
@@ -665,6 +710,7 @@ impl VirtualPhysicalRootV3 {
         {
             return Err(VirtualPhysicalRootErrorV3::DomainDoesNotMatchEnvelope);
         }
+        let evidence_identity = domain.evidence.identity().to_owned();
         let ids = domain
             .candidates
             .iter()
@@ -696,6 +742,7 @@ impl VirtualPhysicalRootV3 {
             let id = candidate.identity.stable_semantic_id();
             let alternative = PhysicalRootAlternativeV3 {
                 identity: candidate.identity,
+                admission_evidence_identity: evidence_identity.clone(),
                 construction_path: candidate.construction_path,
                 state: PhysicalAlternativeStateV3::PartiallyConstructed,
                 executed_response_prefix: candidate.executed_response_prefix,
@@ -775,7 +822,10 @@ impl VirtualPhysicalRootV3 {
         {
             return Err(VirtualPhysicalRootErrorV3::InvalidProgress);
         }
-        successor_binding.validate_for(&alternative.identity)?;
+        successor_binding.validate_for(
+            &alternative.identity,
+            &alternative.admission_evidence_identity,
+        )?;
         alternative.executed_response_prefix = executed_responses.to_vec();
         alternative.successor_binding = Some(successor_binding);
         alternative.state = PhysicalAlternativeStateV3::Completed;
@@ -957,6 +1007,7 @@ impl VirtualPhysicalRootV3 {
         &mut self,
         candidate: PhysicalRootCandidateV3,
         executed_prefix: Vec<String>,
+        admission_evidence_identity: String,
     ) -> Result<String, VirtualPhysicalRootErrorV3> {
         let id = candidate.identity.stable_semantic_id();
         if self.alternatives.contains_key(&id) {
@@ -969,6 +1020,7 @@ impl VirtualPhysicalRootV3 {
         };
         let alternative = PhysicalRootAlternativeV3 {
             identity: candidate.identity,
+            admission_evidence_identity,
             construction_path: candidate.construction_path,
             state,
             executed_response_prefix: executed_prefix,
@@ -1010,6 +1062,7 @@ mod tests {
 
     const OWNER: &str = "engine-decision:p0:revision-17";
     const PROTOCOL: &str = "lightning-bolt-target-v1";
+    const ROOT_CONTINUATION: &str = "priority-stage:revision-17";
     const CONTINUATION: &str = "bolt:ObjectId(7):target-stage-0";
     const CAST: &str = "cast-bolt:object-7";
     const TARGET_P0: &str = "target:player-0";
@@ -1128,6 +1181,19 @@ mod tests {
         }
     }
 
+    fn cast_prefix_progress(from_continuation_identity: &str) -> PrefixProgressAttestationV3 {
+        PrefixProgressAttestationV3 {
+            physical_owner_id: OWNER.to_owned(),
+            actor: PlayerId::P0,
+            from_continuation_identity: from_continuation_identity.to_owned(),
+            to_continuation_identity: CONTINUATION.to_owned(),
+            applied_responses: vec![CAST.to_owned()],
+            provenance: PrefixProgressProvenanceV3::OracleFixture {
+                fixture_identity: "mads03b4-nested-cast-target-v1".to_owned(),
+            },
+        }
+    }
+
     fn target_candidate(order: u32, target_response: &str) -> PhysicalRootCandidateV3 {
         let construction_path = vec![ConstructionSlotIdentityV3 {
             physical_owner_id: OWNER.to_owned(),
@@ -1201,7 +1267,7 @@ mod tests {
             owner_actor: PlayerId::P0,
             protocol_identity: PROTOCOL.to_owned(),
             known_prefix: Vec::new(),
-            continuation_identity: CONTINUATION.to_owned(),
+            continuation_identity: ROOT_CONTINUATION.to_owned(),
             stable_order: 0,
             next_expansion_slot: slot("game:root", "priority", "root", CAST, 0, 0),
             bounds: BoundIntervalV1::UNKNOWN,
@@ -1385,7 +1451,7 @@ mod tests {
                     ],
                     next_actor: Some(PlayerId::P1),
                     provenance: SuccessorProvenanceV3::OracleFixture {
-                        fixture_identity: flat_fixture.fixture_id.clone(),
+                        fixture_identity: nested_fixture.fixture_id.clone(),
                     },
                 },
             )
@@ -1410,7 +1476,7 @@ mod tests {
                     ],
                     next_actor: Some(PlayerId::P1),
                     provenance: SuccessorProvenanceV3::OracleFixture {
-                        fixture_identity: flat_fixture.fixture_id.clone(),
+                        fixture_identity: nested_fixture.fixture_id.clone(),
                     },
                 },
             )
@@ -1446,6 +1512,7 @@ mod tests {
                     0,
                     1,
                 ),
+                cast_prefix_progress(ROOT_CONTINUATION),
             )
             .unwrap();
         assert_ne!(initial_envelope_id, envelope_id);
@@ -1623,6 +1690,42 @@ mod tests {
     #[test]
     fn complete_domain_attestation_is_atomic_and_rejects_missing_or_duplicate_candidates() {
         let (mut root, _, _, envelope_id) = root_with_prefix();
+        let stale_progress = root.advance_unresolved_prefix(
+            &envelope_id,
+            vec![CAST.to_owned()],
+            slot(
+                "construction:bolt:target-stage-0",
+                PROTOCOL,
+                "target-pick-stage-0",
+                "enumerate-complete-target-domain",
+                0,
+                1,
+            ),
+            cast_prefix_progress("stale-decision-revision"),
+        );
+        assert_eq!(
+            stale_progress,
+            Err(VirtualPhysicalRootErrorV3::InvalidProgress)
+        );
+        let mut wrong_actor_progress = cast_prefix_progress(ROOT_CONTINUATION);
+        wrong_actor_progress.actor = PlayerId::P1;
+        assert_eq!(
+            root.advance_unresolved_prefix(
+                &envelope_id,
+                vec![CAST.to_owned()],
+                slot(
+                    "construction:bolt:target-stage-0",
+                    PROTOCOL,
+                    "target-pick-stage-0",
+                    "enumerate-complete-target-domain",
+                    0,
+                    1,
+                ),
+                wrong_actor_progress,
+            ),
+            Err(VirtualPhysicalRootErrorV3::InvalidProgress)
+        );
+        assert!(root.envelopes.contains_key(&envelope_id));
         let envelope_id = root
             .advance_unresolved_prefix(
                 &envelope_id,
@@ -1635,6 +1738,7 @@ mod tests {
                     0,
                     1,
                 ),
+                cast_prefix_progress(ROOT_CONTINUATION),
             )
             .unwrap();
         let incomplete = CompletePhysicalActionDomainV3::new(
@@ -1751,6 +1855,7 @@ mod tests {
                     0,
                     1,
                 ),
+                cast_prefix_progress(ROOT_CONTINUATION),
             )
             .unwrap();
         let p0_id = root
@@ -1787,7 +1892,7 @@ mod tests {
                         graph_path_node_ids: path,
                         next_actor: Some(PlayerId::P0),
                         provenance: SuccessorProvenanceV3::OracleFixture {
-                            fixture_identity: "oracle".to_owned(),
+                            fixture_identity: "mads03b4-flat-physical-root-v1".to_owned(),
                         },
                     },
                 ),
