@@ -171,24 +171,87 @@ fn one_run(
     Ok((initialization_wall, search_wall, result))
 }
 
+fn validate_result_against_oracle(
+    stage: &str,
+    result: &mtg_kernel::mads_v1::SearchResultV1,
+    oracle: &mtg_kernel::oracle_suite_v1::OracleResultV1,
+) -> Result<(), String> {
+    if result.root_bounds.lower > oracle.root_value || result.root_bounds.upper < oracle.root_value
+    {
+        return Err(format!(
+            "{stage}: MADS root bounds exclude exact Oracle value"
+        ));
+    }
+    let observed_root_actions = result
+        .root_actions
+        .iter()
+        .map(|action| action.stable_id.clone())
+        .collect::<Vec<_>>();
+    if observed_root_actions != oracle.complete_legal_root_actions {
+        return Err(format!(
+            "{stage}: MADS root-action domain/order differs from Oracle"
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for action in &result.certified_optimal_actions {
+        if !seen.insert(action.as_str()) {
+            return Err(format!("{stage}: duplicate certified root action"));
+        }
+        if !oracle.optimal_root_actions.contains(action) {
+            return Err(format!(
+                "{stage}: certified root action {action} is not Oracle-optimal"
+            ));
+        }
+    }
+    match result.status {
+        mtg_kernel::mads_v1::CertificationStatusV1::Certified => {
+            let chosen = result
+                .chosen_action
+                .as_deref()
+                .ok_or_else(|| format!("{stage}: Certified status has no chosen certificate"))?;
+            if !result
+                .certified_optimal_actions
+                .iter()
+                .any(|action| action == chosen)
+            {
+                return Err(format!(
+                    "{stage}: chosen action is absent from certificate set"
+                ));
+            }
+            if !oracle
+                .optimal_root_actions
+                .iter()
+                .any(|action| action == chosen)
+            {
+                return Err(format!(
+                    "{stage}: chosen certified action is not Oracle-optimal"
+                ));
+            }
+        }
+        mtg_kernel::mads_v1::CertificationStatusV1::UnresolvedWithinBudget => {
+            if result.chosen_action.is_some() || !result.certified_optimal_actions.is_empty() {
+                return Err(format!(
+                    "{stage}: unresolved result carries a chosen/certified action"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 fn measure(
     fixture: &OracleFixtureV1,
-    expected_root: i8,
+    oracle: &mtg_kernel::oracle_suite_v1::OracleResultV1,
     iterations: usize,
     budget: usize,
 ) -> Result<MeasurementsV1, String> {
     for _ in 0..WARMUPS_V1 {
         let (_, _, result) = one_run(fixture, budget)?;
-        if result.root_bounds.lower > expected_root || result.root_bounds.upper < expected_root {
-            return Err("warmup MADS bounds exclude exact Oracle value".to_owned());
-        }
+        validate_result_against_oracle("warmup", &result, oracle)?;
     }
     let mut measured = MeasurementsV1::default();
     for _ in 0..iterations {
         let (initialization_wall, search_wall, result) = one_run(fixture, budget)?;
-        if result.root_bounds.lower > expected_root || result.root_bounds.upper < expected_root {
-            return Err("MADS bounds exclude exact Oracle value".to_owned());
-        }
+        validate_result_against_oracle("measured run", &result, oracle)?;
         measured.initialization_wall += initialization_wall;
         measured.search_wall += search_wall;
         measured.unknown_runs += usize::from(
@@ -244,7 +307,7 @@ fn report(
         budget, WARMUPS_V1, iterations
     );
     println!(
-        "oracle_root_value={} oracle_optimal_actions={:?} oracle_legal_root_actions={:?} oracle_game_nodes={} oracle_edges={} oracle_solve_wall_ns={}",
+        "oracle_root_value={} oracle_optimal_actions={:?} oracle_legal_root_actions={:?} oracle_game_nodes={} oracle_edges={} oracle_solve_wall_single_ns={}",
         oracle.root_value,
         oracle.optimal_root_actions,
         oracle.complete_legal_root_actions,
@@ -340,7 +403,7 @@ fn main() {
             dag_oracle_wall,
         ),
     ] {
-        let measurements = measure(fixture, oracle.root_value, config.iterations, config.budget)
+        let measurements = measure(fixture, oracle, config.iterations, config.budget)
             .unwrap_or_else(|error| {
                 panic!("{} failed its Oracle check: {error}", encoding.as_str())
             });
