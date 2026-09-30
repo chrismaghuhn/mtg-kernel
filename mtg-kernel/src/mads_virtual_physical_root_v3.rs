@@ -159,7 +159,9 @@ pub enum SuccessorProvenanceV3 {
     AuthoritativeTransition {
         source_frame_identity: String,
         transition_identity: String,
+        transition_response_identity: String,
         physical_response_identity: String,
+        successor_frame_identity: String,
     },
     OracleFixture {
         domain_fixture_identity: String,
@@ -179,11 +181,16 @@ impl SuccessorBindingV3 {
             SuccessorProvenanceV3::AuthoritativeTransition {
                 source_frame_identity,
                 transition_identity,
+                transition_response_identity,
                 physical_response_identity,
+                successor_frame_identity,
             } => {
                 source_frame_identity == admission_evidence_identity
                     && !transition_identity.is_empty()
+                    && identity.ordered_engine_responses.last()
+                        == Some(transition_response_identity)
                     && physical_response_identity == &response_identity
+                    && successor_frame_identity == &self.successor_node_id
             }
             SuccessorProvenanceV3::OracleFixture {
                 domain_fixture_identity,
@@ -297,8 +304,15 @@ pub enum CompleteDomainEvidenceV3 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefixProgressProvenanceV3 {
-    AuthoritativeTransition { transition_identity: String },
-    OracleFixture { fixture_identity: String },
+    AuthoritativeTransition {
+        source_frame_identity: String,
+        transition_identity: String,
+        response_identity: String,
+        successor_frame_identity: String,
+    },
+    OracleFixture {
+        fixture_identity: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,12 +326,22 @@ pub struct PrefixProgressAttestationV3 {
 }
 
 impl PrefixProgressAttestationV3 {
-    fn provenance_identity(&self) -> &str {
+    fn binds_progress(&self) -> bool {
         match &self.provenance {
             PrefixProgressProvenanceV3::AuthoritativeTransition {
+                source_frame_identity,
                 transition_identity,
-            } => transition_identity,
-            PrefixProgressProvenanceV3::OracleFixture { fixture_identity } => fixture_identity,
+                response_identity,
+                successor_frame_identity,
+            } => {
+                source_frame_identity == &self.from_continuation_identity
+                    && !transition_identity.is_empty()
+                    && self.applied_responses == [response_identity.clone()]
+                    && successor_frame_identity == &self.to_continuation_identity
+            }
+            PrefixProgressProvenanceV3::OracleFixture { fixture_identity } => {
+                !fixture_identity.is_empty()
+            }
         }
     }
 }
@@ -589,6 +613,9 @@ pub struct VirtualPhysicalRootV3 {
     pub owner_actor: PlayerId,
     alternatives: BTreeMap<String, PhysicalRootAlternativeV3>,
     envelopes: BTreeMap<String, UnresolvedConstructionEnvelopeV3>,
+    /// Immutable attestation of the original raw Engine root alternatives.
+    /// It is not an attestation of a later Construction prefix or of admitted
+    /// complete physical candidates; those require transition/domain evidence.
     root_domain_attestation: Option<PhysicalRootDomainAttestationV3>,
 }
 
@@ -712,7 +739,7 @@ impl VirtualPhysicalRootV3 {
             || progress.to_continuation_identity.is_empty()
             || progress.applied_responses.is_empty()
             || progress.applied_responses != executed_prefix[envelope.known_prefix.len()..]
-            || progress.provenance_identity().is_empty()
+            || !progress.binds_progress()
         {
             return Err(VirtualPhysicalRootErrorV3::InvalidProgress);
         }
@@ -727,6 +754,9 @@ impl VirtualPhysicalRootV3 {
         if next_id != envelope_id && self.envelopes.contains_key(&next_id) {
             return Err(VirtualPhysicalRootErrorV3::DuplicateEnvelope);
         }
+        // The initial root seal remains immutable and continues to name the
+        // original raw decision domain. It is not reused as evidence for this
+        // new continuation; `progress` is the separate transition evidence.
         self.envelopes.remove(envelope_id);
         self.envelopes.insert(next_id.clone(), envelope);
         Ok(next_id)
@@ -743,6 +773,9 @@ impl VirtualPhysicalRootV3 {
         if self.root_domain_attestation.is_none() {
             return Err(VirtualPhysicalRootErrorV3::RootDomainNotAttested);
         }
+        // `root_domain_attestation` proves only the immutable original raw
+        // root domain. This candidate-domain attestation separately proves
+        // the current construction frame and complete physical alternatives.
         domain.validate()?;
         let envelope = self
             .envelopes
@@ -784,6 +817,8 @@ impl VirtualPhysicalRootV3 {
         }
 
         // All validation has completed; now replace the prefix as one mutation.
+        // The original root seal is deliberately left untouched. The current
+        // candidate domain has its own exact ordered frame evidence below.
         self.envelopes.remove(envelope_id);
         for candidate in domain.candidates {
             let id = candidate.identity.stable_semantic_id();
@@ -1524,6 +1559,7 @@ mod tests {
         );
 
         let (mut virtual_root, pass_id, other_id, envelope_id) = root_with_prefix();
+        let raw_root_seal = virtual_root.root_domain_attestation.clone().unwrap();
         assert!(!virtual_root.root_action_domain_complete());
         assert_eq!(virtual_root.root_bounds(), BoundIntervalV1::UNKNOWN);
         assert!(virtual_root.certified_optimal_alternative_ids().is_empty());
@@ -1648,11 +1684,19 @@ mod tests {
             )
             .unwrap();
         assert_ne!(initial_envelope_id, envelope_id);
+        assert_eq!(
+            virtual_root.root_domain_attestation.as_ref(),
+            Some(&raw_root_seal)
+        );
+        assert!(raw_root_seal.ordered_root_item_ids.contains(&initial_envelope_id),
+            "the immutable seal records the original raw-root item; it is not evidence for the advanced prefix");
         assert!(!virtual_root.root_action_domain_complete());
         let domain = oracle_domain();
         let candidate_ids = virtual_root
             .admit_complete_domain(&envelope_id, domain)
             .unwrap();
+        assert_eq!(virtual_root.root_domain_attestation.as_ref(), Some(&raw_root_seal),
+            "complete construction alternatives require their own domain evidence and do not rewrite the root seal");
         assert_eq!(candidate_ids.len(), 2);
         assert!(virtual_root.root_action_domain_complete());
         assert_eq!(virtual_root.alternatives.len(), 4);
@@ -2098,32 +2142,125 @@ mod tests {
         .unwrap();
         let p0_id = root.admit_complete_domain(&envelope_id, domain).unwrap()[0].clone();
         let responses = vec![CAST.to_owned(), TARGET_P0.to_owned()];
-        let make_binding = |source_frame_identity: &str| SuccessorBindingV3 {
-            physical_owner_id: OWNER.to_owned(),
-            owner_graph_node_id: "game:root".to_owned(),
-            ordered_engine_responses: responses.clone(),
-            finalization_boundary: "cast-finalized".to_owned(),
-            successor_node_id: "engine-successor:2".to_owned(),
-            next_expansion_slot: None,
-            graph_path_node_ids: vec!["game:root".to_owned(), "engine-successor:2".to_owned()],
-            next_actor: Some(PlayerId::P0),
-            provenance: SuccessorProvenanceV3::AuthoritativeTransition {
-                source_frame_identity: source_frame_identity.to_owned(),
-                transition_identity: "engine-transition:91".to_owned(),
-                physical_response_identity: p0_id.clone(),
-            },
-        };
+        let make_binding =
+            |source_frame_identity: &str,
+             transition_identity: &str,
+             transition_response_identity: &str,
+             physical_response_identity: &str,
+             successor_node_id: &str,
+             successor_frame_identity: &str| SuccessorBindingV3 {
+                physical_owner_id: OWNER.to_owned(),
+                owner_graph_node_id: "game:root".to_owned(),
+                ordered_engine_responses: responses.clone(),
+                finalization_boundary: "cast-finalized".to_owned(),
+                successor_node_id: successor_node_id.to_owned(),
+                next_expansion_slot: None,
+                graph_path_node_ids: vec!["game:root".to_owned(), successor_node_id.to_owned()],
+                next_actor: Some(PlayerId::P0),
+                provenance: SuccessorProvenanceV3::AuthoritativeTransition {
+                    source_frame_identity: source_frame_identity.to_owned(),
+                    transition_identity: transition_identity.to_owned(),
+                    transition_response_identity: transition_response_identity.to_owned(),
+                    physical_response_identity: physical_response_identity.to_owned(),
+                    successor_frame_identity: successor_frame_identity.to_owned(),
+                },
+            };
         assert_ne!(frame_identity, "engine-transition:91");
+        for invalid in [
+            make_binding(
+                "other-frame",
+                "engine-transition:91",
+                TARGET_P0,
+                &p0_id,
+                "engine-successor:2",
+                "engine-successor:2",
+            ),
+            make_binding(
+                frame_identity,
+                "",
+                TARGET_P0,
+                &p0_id,
+                "engine-successor:2",
+                "engine-successor:2",
+            ),
+            make_binding(
+                frame_identity,
+                "engine-transition:91",
+                "wrong-transition-response",
+                &p0_id,
+                "engine-successor:2",
+                "engine-successor:2",
+            ),
+            make_binding(
+                frame_identity,
+                "engine-transition:91",
+                TARGET_P0,
+                "wrong-physical-response",
+                "engine-successor:2",
+                "engine-successor:2",
+            ),
+            make_binding(
+                frame_identity,
+                "engine-transition:91",
+                TARGET_P0,
+                &p0_id,
+                "engine-successor:2",
+                "wrong-successor-frame",
+            ),
+            make_binding(
+                frame_identity,
+                "engine-transition:91",
+                TARGET_P0,
+                &p0_id,
+                "wrong-successor-node",
+                "engine-successor:2",
+            ),
+        ] {
+            assert_eq!(
+                root.complete_alternative(&p0_id, &responses, invalid),
+                Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding)
+            );
+            assert_eq!(
+                root.alternatives[&p0_id].state,
+                PhysicalAlternativeStateV3::PartiallyConstructed,
+                "invalid successor provenance must be rejected atomically"
+            );
+        }
+        let mut wrong_successor_actor = make_binding(
+            frame_identity,
+            "engine-transition:91",
+            TARGET_P0,
+            &p0_id,
+            "engine-successor:2",
+            "engine-successor:2",
+        );
+        wrong_successor_actor.next_actor = Some(PlayerId::P1);
+        wrong_successor_actor.next_expansion_slot = Some(actor_slot(
+            "engine-successor:2",
+            PlayerId::P0,
+            "priority",
+            "post-target",
+            "continue",
+            0,
+            1,
+        ));
         assert_eq!(
-            root.complete_alternative(&p0_id, &responses, make_binding("other-frame")),
+            root.complete_alternative(&p0_id, &responses, wrong_successor_actor),
             Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding)
         );
-        assert_eq!(
-            root.alternatives[&p0_id].state,
-            PhysicalAlternativeStateV3::PartiallyConstructed
-        );
-        root.complete_alternative(&p0_id, &responses, make_binding(frame_identity))
-            .unwrap();
+        root.complete_alternative(
+            &p0_id,
+            &responses,
+            make_binding(
+                frame_identity,
+                "engine-transition:91",
+                TARGET_P0,
+                &p0_id,
+                "engine-successor:2",
+                "engine-successor:2",
+            ),
+        )
+        .unwrap();
         assert_eq!(
             root.alternatives[&p0_id].state,
             PhysicalAlternativeStateV3::Completed

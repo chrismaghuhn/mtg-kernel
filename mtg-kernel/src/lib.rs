@@ -98,6 +98,8 @@ pub mod mads_v1;
 pub mod mads_decision_state_key_v1;
 // Versioned, fail-closed typed adapter for the audited PendingCast target stage.
 // It is not integrated into DynamicEngineSearchV1; incomplete actions cannot be certified.
+/// Authoritative, path-local Engine binding for the admitted MADS-03B5 Bolt/Pass scope.
+pub mod mads03b5_engine_binding_v3;
 #[allow(dead_code)]
 pub(crate) mod mads_decision_construction_v1;
 pub mod mads_virtual_physical_root_v3;
