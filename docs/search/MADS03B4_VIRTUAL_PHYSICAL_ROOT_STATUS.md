@@ -85,6 +85,8 @@ Cargo commands were serialized by `Global\\mtg-kernel-cargo-build.lock`, used `-
 
 The repository has two known `clippy::type_complexity` findings in existing `dynamic_engine_search_v1.rs` debug helpers; that file was not modified. Test-target Clippy was run with only that known lint allow-listed. Full Workspace, Release/Thin-LTO, CUDA, and broad benchmark suites were not run.
 
+During development, one V3 test run failed after adding the `Other` root response because an assertion still expected one existing alternative instead of Pass and Other. The fixture expectation was corrected; the final four-test V3 module run passed.
+
 ## Gate and open obligations
 
 ```text
