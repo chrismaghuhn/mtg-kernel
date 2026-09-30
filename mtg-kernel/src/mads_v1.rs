@@ -1361,7 +1361,7 @@ mod tests {
             assert_eq!(
                 action_bounds
                     .iter()
-                    .map(|action| action.stable_id.as_str())
+                    .map(|action| action.stable_id.clone())
                     .collect::<Vec<_>>(),
                 truth
                     .complete_legal_root_actions
@@ -1732,6 +1732,140 @@ mod tests {
             result.metrics.authoritative_transitions,
             result.metrics.state_clones,
             mads_wall.as_nanos(),
+        );
+    }
+    #[test]
+    fn path_local_tree_and_fixture_id_dag_match_oracle_with_exact_tt_hits() {
+        let shared = fixture(
+            vec![edge(0, "left", 1), edge(1, "right", 2)],
+            vec![
+                OracleNodeV1::GameDecision {
+                    id: FixtureNodeId(1),
+                    actor: FixturePlayerV1::P1,
+                    actions: vec![edge(0, "shared-a", 3), edge(1, "draw-a", 4)],
+                },
+                OracleNodeV1::GameDecision {
+                    id: FixtureNodeId(2),
+                    actor: FixturePlayerV1::P1,
+                    actions: vec![edge(0, "shared-b", 3), edge(1, "draw-b", 4)],
+                },
+                OracleNodeV1::GameDecision {
+                    id: FixtureNodeId(3),
+                    actor: FixturePlayerV1::P0,
+                    actions: vec![edge(0, "win", 5), edge(1, "loss", 6)],
+                },
+                terminal(4, FixtureOutcomeV1::Draw),
+                terminal(5, FixtureOutcomeV1::Win),
+                terminal(6, FixtureOutcomeV1::Loss),
+            ],
+        );
+        let unrolled = fixture(
+            vec![edge(0, "left", 1), edge(1, "right", 2)],
+            vec![
+                OracleNodeV1::GameDecision {
+                    id: FixtureNodeId(1),
+                    actor: FixturePlayerV1::P1,
+                    actions: vec![edge(0, "shared-a", 3), edge(1, "draw-a", 4)],
+                },
+                OracleNodeV1::GameDecision {
+                    id: FixtureNodeId(2),
+                    actor: FixturePlayerV1::P1,
+                    actions: vec![edge(0, "shared-b", 7), edge(1, "draw-b", 8)],
+                },
+                OracleNodeV1::GameDecision {
+                    id: FixtureNodeId(3),
+                    actor: FixturePlayerV1::P0,
+                    actions: vec![edge(0, "win-a", 5), edge(1, "loss-a", 6)],
+                },
+                terminal(4, FixtureOutcomeV1::Draw),
+                terminal(5, FixtureOutcomeV1::Win),
+                terminal(6, FixtureOutcomeV1::Loss),
+                OracleNodeV1::GameDecision {
+                    id: FixtureNodeId(7),
+                    actor: FixturePlayerV1::P0,
+                    actions: vec![edge(0, "win-b", 9), edge(1, "loss-b", 10)],
+                },
+                terminal(8, FixtureOutcomeV1::Draw),
+                terminal(9, FixtureOutcomeV1::Win),
+                terminal(10, FixtureOutcomeV1::Loss),
+            ],
+        );
+        let shared_truth = oracle(&shared);
+        let tree_truth = oracle(&unrolled);
+        assert_eq!(shared_truth.root_value, FixtureOutcomeV1::Draw.value());
+        assert_eq!(tree_truth.root_value, shared_truth.root_value);
+        assert_eq!(
+            shared_truth.optimal_root_actions,
+            tree_truth.optimal_root_actions
+        );
+
+        let mut dag_search = MadsGraphV1::new(&shared).unwrap();
+        while dag_search.expand_next_v1().unwrap().is_some() {
+            for node in &dag_search.nodes {
+                let exact = shared_truth.node_values[&node.fixture_key()];
+                assert!(node.bounds().lower <= exact && exact <= node.bounds().upper);
+            }
+        }
+        let mut tree_search = MadsGraphV1::new(&unrolled).unwrap();
+        while tree_search.expand_next_v1().unwrap().is_some() {
+            for node in &tree_search.nodes {
+                let exact = tree_truth.node_values[&node.fixture_key()];
+                assert!(node.bounds().lower <= exact && exact <= node.bounds().upper);
+            }
+        }
+
+        let dag_result = dag_search.result_v1();
+        let tree_result = tree_search.result_v1();
+        assert_eq!(
+            dag_result.root_bounds,
+            BoundIntervalV1::exact(FixtureOutcomeV1::Draw.value())
+        );
+        assert_eq!(dag_result.root_bounds, tree_result.root_bounds);
+        let dag_root_ids = dag_result
+            .root_actions
+            .iter()
+            .map(|action| action.stable_id.clone())
+            .collect::<Vec<_>>();
+        let tree_root_ids = tree_result
+            .root_actions
+            .iter()
+            .map(|action| action.stable_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(dag_root_ids, shared_truth.complete_legal_root_actions);
+        assert_eq!(tree_root_ids, tree_truth.complete_legal_root_actions);
+        assert_eq!(
+            shared_truth.complete_legal_root_actions,
+            tree_truth.complete_legal_root_actions
+        );
+        assert_eq!(shared_truth.optimal_root_actions, vec!["left", "right"]);
+        for action in dag_result
+            .certified_optimal_actions
+            .iter()
+            .chain(&tree_result.certified_optimal_actions)
+        {
+            assert!(
+                shared_truth.optimal_root_actions.contains(action),
+                "certified nonoptimal root action: {action}"
+            );
+        }
+        assert!(dag_result.metrics.valid_tt_hits > 0);
+        assert_eq!(tree_result.metrics.valid_tt_hits, 0);
+        assert!(dag_result.metrics.graph_nodes_created < tree_result.metrics.graph_nodes_created);
+
+        let shared_node = dag_search.node_by_fixture_id[&FixtureNodeId(3)];
+        assert_eq!(dag_search.reverse_parents[shared_node].len(), 2);
+        println!(
+            "MADS03D_SYNTHETIC_DAG shared_nodes={} path_nodes={} avoided_duplicate_nodes={} shared_actions={} path_actions={} fixture_id_tt_lookups={} fixture_id_tt_hits={} pathlocal_lookups={} pathlocal_hits={} root_value={} status=fixture_only",
+            dag_result.metrics.graph_nodes_created,
+            tree_result.metrics.graph_nodes_created,
+            tree_result.metrics.graph_nodes_created - dag_result.metrics.graph_nodes_created,
+            dag_result.metrics.expanded_actions,
+            tree_result.metrics.expanded_actions,
+            dag_result.metrics.tt_lookups,
+            dag_result.metrics.valid_tt_hits,
+            tree_result.metrics.tt_lookups,
+            tree_result.metrics.valid_tt_hits,
+            dag_result.root_bounds.lower,
         );
     }
 }
