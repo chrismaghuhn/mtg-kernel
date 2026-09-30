@@ -381,12 +381,28 @@ fn apnap_trigger_group_can_yield_a_distinct_opponent_decision() {
         .iter()
         .all(|trigger| trigger.controller == PlayerId::P1));
 
+    let second = engine::advance_until_decision(&mut state);
     assert!(matches!(
-        engine::advance_until_decision(&mut state),
+        &second,
         Decision::OrderTriggers {
             player: PlayerId::P1,
             pending,
         } if pending.len() == 2
+    ));
+    assert!(matches!(
+        crate::mads_decision_construction_v1::classify_after_transition_v1(
+            Some(PlayerId::P0),
+            &state,
+            &second
+        ),
+        Ok(
+            crate::mads_decision_construction_v1::ClassifiedDecisionV1::ActorSwitch {
+                from: PlayerId::P0,
+                to: PlayerId::P1,
+                kind: crate::mads_decision_construction_v1::ActorSwitchKindV1::ApnapTriggerGroup,
+                ..
+            }
+        )
     ));
     assert_eq!(state.stack.len(), 2, "no priority window intervenes");
 }
@@ -500,4 +516,168 @@ fn raw_v5_rejects_unreshaped_combat_and_multi_card_discard_protocols() {
     assert!(discard_error
         .to_string()
         .contains("expected count=1 after H2 reshape"));
+}
+#[test]
+fn typed_pending_cast_target_adapter_preserves_domain_and_finalizes_only_after_pick() {
+    use crate::mads_decision_construction_v1::{
+        classify_after_transition_v1, ClassifiedDecisionV1, ConstructionStageV1,
+    };
+
+    let mut state = burn_start_with_mountain_and_bolt();
+    let decision = first_p0_main1(&mut state);
+    let mut replay_state = burn_start_with_mountain_and_bolt();
+    let replay_decision = first_p0_main1(&mut replay_state);
+    assert_eq!(
+        state, replay_state,
+        "same fixture seed reproduces the decision state"
+    );
+    assert_eq!(
+        decision, replay_decision,
+        "same fixture seed reproduces the full decision domain"
+    );
+    let Decision::CastSpellOrPass { land_drops, .. } = decision else {
+        unreachable!()
+    };
+    let mountain = land_drops
+        .into_iter()
+        .find(|id| state.objects.get(*id).card_def == card_id_by_name("Mountain").unwrap())
+        .expect("opening hand contains a legal Mountain");
+    engine::step(&mut state, Action::PlayLand(mountain)).unwrap();
+    let Decision::CastSpellOrPass { mana_abilities, .. } =
+        engine::advance_until_decision(&mut state)
+    else {
+        panic!("land play returns to priority")
+    };
+    assert!(mana_abilities.contains(&mountain));
+    engine::step(&mut state, Action::ActivateManaAbility(mountain)).unwrap();
+    let cast_decision = engine::advance_until_decision(&mut state);
+    let Decision::CastSpellOrPass {
+        player,
+        castable_spells,
+        ..
+    } = cast_decision.clone()
+    else {
+        panic!("mana ability returns to priority")
+    };
+    assert_eq!(player, PlayerId::P0);
+    let bolt = castable_spells
+        .into_iter()
+        .find(|id| state.objects.get(*id).card_def == card_id_by_name("Lightning Bolt").unwrap())
+        .expect("opened red mana pays for Lightning Bolt");
+    let ClassifiedDecisionV1::GameDecision {
+        construction_starting_actions,
+        ..
+    } = classify_after_transition_v1(Some(PlayerId::P0), &state, &cast_decision)
+        .expect("fresh priority decision is a game-decision node")
+    else {
+        panic!("same-actor priority frame is not a construction node")
+    };
+    assert!(construction_starting_actions.contains(&Action::CastSpell(bolt)));
+
+    // CastSpell begins a pending physical action; it is not a completed action
+    // result. The typed protocol exists until the target is selected and the
+    // authoritative walk finalizes the cast.
+    engine::step(&mut state, Action::CastSpell(bolt)).unwrap();
+    let target_decision = engine::advance_until_decision(&mut state);
+    let ClassifiedDecisionV1::Construction(context) =
+        classify_after_transition_v1(Some(PlayerId::P0), &state, &target_decision)
+            .expect("authoritative target continuation classifies")
+    else {
+        panic!("pending cast target must remain construction")
+    };
+    assert_eq!(
+        context.adapter_version,
+        crate::mads_decision_construction_v1::DECISION_CONSTRUCTION_ADAPTER_VERSION_V1
+    );
+    assert_eq!(context.initiator, PlayerId::P0);
+    assert_eq!(context.stage, ConstructionStageV1::PendingCastTargetPick);
+    assert_eq!(context.pending_cast.spell, bolt);
+    assert!(context.ordered_target_prefix.is_empty());
+    assert_eq!(context.remaining_cardinality, 1);
+    let Decision::ChooseTargets {
+        legal_targets,
+        player,
+        spell,
+        remaining,
+        ..
+    } = &context.decision
+    else {
+        panic!("context retains the exact target decision")
+    };
+    assert_eq!((*player, *spell, *remaining), (PlayerId::P0, bolt, 1));
+    let expected = legal_targets
+        .iter()
+        .cloned()
+        .map(Action::ChooseTarget)
+        .collect::<Vec<_>>();
+    assert_eq!(context.legal_candidates, expected);
+
+    // Cross-check the complete order against the existing V5 projection and
+    // independently apply every listed Engine action on an isolated clone.
+    let projected = legal_action_candidates_v5(
+        &PolicyDecisionV5::Surface(SurfaceDecision::Decision(target_decision.clone())),
+        &state,
+    )
+    .expect("V5 maps this raw target domain");
+    let projected_actions = projected
+        .into_iter()
+        .map(|candidate| match candidate.policy_action {
+            crate::policy_surface_v5::PolicyActionV5::Surface(SurfaceAction::Action(action)) => {
+                action
+            }
+            _ => panic!("raw target candidate unexpectedly became a surface microstep"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(context.legal_candidates, projected_actions);
+    for candidate in &context.legal_candidates {
+        let mut branch = state.clone();
+        engine::step(&mut branch, candidate.clone()).expect("every listed target is legal");
+        let selected_targets = branch
+            .engine
+            .pending_cast
+            .as_ref()
+            .unwrap()
+            .targets_chosen
+            .clone();
+        assert_eq!(selected_targets.len(), 1);
+        let next = engine::advance_until_decision(&mut branch);
+        assert!(branch.engine.pending_cast.is_none());
+        assert!(matches!(
+            next,
+            Decision::CastSpellOrPass {
+                player: PlayerId::P0,
+                ..
+            }
+        ));
+        assert_eq!(branch.stack.last().unwrap().targets, selected_targets);
+    }
+
+    let mut stale = target_decision.clone();
+    let Decision::ChooseTargets { player, .. } = &mut stale else {
+        unreachable!()
+    };
+    *player = PlayerId::P1;
+    assert_eq!(
+        classify_after_transition_v1(Some(PlayerId::P0), &state, &stale),
+        Err(crate::mads_decision_construction_v1::DecisionClassificationErrorV1::InvalidOrStaleDecisionFrame)
+    );
+
+    engine::step(
+        &mut state,
+        Action::ChooseTarget(Target::Player(PlayerId::P1)),
+    )
+    .unwrap();
+    let finalized_decision = engine::advance_until_decision(&mut state);
+    assert!(state.engine.pending_cast.is_none());
+    assert_eq!(
+        state.stack.last().unwrap().targets,
+        [Target::Player(PlayerId::P1)]
+    );
+    assert!(matches!(
+        classify_after_transition_v1(Some(PlayerId::P0), &state, &finalized_decision),
+        Ok(ClassifiedDecisionV1::GameDecision {
+            actor: PlayerId::P0,
+            ..
+        })
+    ));
 }
