@@ -3,12 +3,15 @@
 //! This adapter deliberately uses path-local nodes and no transposition table.
 //! Only complete, explicitly enumerated decision domains are admitted.
 use crate::engine::{self, Action, Decision};
-use crate::ids::PlayerId;
+use crate::ids::{ObjectId, PlayerId};
+use crate::mads_decision_construction_v1::{
+    classify_after_transition_v1, ActorSwitchKindV1, ClassifiedDecisionV1, DecisionConstructionV1,
+};
 use crate::mads_v1::{
     backup_bounds_v1, critical_support_v1, BoundIntervalV1, ExpansionRoleMaskV1,
     ExpansionSemanticOrderV1, MadsRoleV1, WIN_V1,
 };
-use crate::state::GameState;
+use crate::state::{FinalizedCastBindingV1, GameState, StackItem, Target};
 
 type DynamicFrontierSortKeyV1 = (
     u8,
@@ -114,6 +117,58 @@ pub struct DynamicSearchResultV1 {
     pub metrics: DynamicSearchMetricsV1,
 }
 
+pub const COMPLETE_PHYSICAL_ACTION_SCHEMA_V2: u16 = 2;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PhysicalActionFinalizationV2 {
+    CastFinalized {
+        source: ObjectId,
+        stack_item: Box<StackItem>,
+        finalized_binding: FinalizedCastBindingV1,
+    },
+    EngineDecisionReached(Decision),
+    Terminal {
+        winner: Option<PlayerId>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletePhysicalActionIdentityV2 {
+    pub schema_version: u16,
+    pub initiating_decision: Decision,
+    pub ordered_engine_responses: Vec<Action>,
+    pub finalization_boundary: PhysicalActionFinalizationV2,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletePhysicalActionV2 {
+    pub stable_semantic_identity: String,
+    pub identity: CompletePhysicalActionIdentityV2,
+    pub bounds: BoundIntervalV1,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncompletePhysicalActionFrontierV2 {
+    pub stable_prefix_identity: String,
+    pub owner_semantic_path: Vec<u32>,
+    pub next_action_id: String,
+    pub ordered_engine_responses: Vec<Action>,
+    pub bounds: BoundIntervalV1,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynamicSearchResultV2 {
+    pub status: DynamicSearchStatusV1,
+    pub chosen_action: Option<CompletePhysicalActionV2>,
+    pub certified_optimal_actions: Vec<CompletePhysicalActionV2>,
+    pub exact_root_value: Option<i8>,
+    pub root_bounds: BoundIntervalV1,
+    pub root_engine_actions: Vec<DynamicRootActionV1>,
+    pub complete_root_actions: Vec<CompletePhysicalActionV2>,
+    pub incomplete_root_frontier: Vec<IncompletePhysicalActionFrontierV2>,
+    pub root_action_domain_complete: bool,
+    pub metrics: DynamicSearchMetricsV1,
+}
 #[derive(Debug, Clone)]
 struct Slot {
     id: String,
@@ -124,6 +179,8 @@ struct Slot {
 struct Node {
     state: GameState,
     decision: Decision,
+    actor: Option<PlayerId>,
+    construction_context: Option<Box<DecisionConstructionV1>>,
     role: Option<MadsRoleV1>,
     slots: Vec<Slot>,
     parent: Option<usize>,
@@ -566,6 +623,350 @@ impl DynamicEngineSearchV1 {
     }
 }
 
+/// Additive V2 search surface whose certificates name complete physical
+/// responses. V1 remains a one-Engine-Action API with unchanged semantics.
+#[derive(Debug)]
+pub struct DynamicEngineSearchV2 {
+    inner: DynamicEngineSearchV1,
+    initiating_decision: Decision,
+}
+
+impl DynamicEngineSearchV2 {
+    pub const API_VERSION: u16 = 2;
+    pub const FRONTIER_POLICY: &'static str = DynamicEngineSearchV1::FRONTIER_POLICY;
+
+    pub fn new(
+        root_state: &GameState,
+        root_decision: Decision,
+    ) -> Result<Self, DynamicSearchErrorV1> {
+        let inner = DynamicEngineSearchV1::new(root_state, root_decision.clone())?;
+        Ok(Self {
+            inner,
+            initiating_decision: root_decision,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_expand_root_engine_action_v2(
+        &mut self,
+        action: &Action,
+    ) -> Result<(), DynamicSearchStatusV1> {
+        let Some(slot) = self.inner.nodes[self.inner.root]
+            .slots
+            .iter()
+            .position(|slot| &slot.action == action && slot.child.is_none())
+        else {
+            return Err(DynamicSearchStatusV1::UnresolvedWithinBudget);
+        };
+        self.expand_slot_v2(self.inner.root, slot)
+    }
+    #[cfg(test)]
+    pub(crate) fn debug_construction_candidates_v2(
+        &self,
+        root_action: &Action,
+    ) -> Option<(Vec<u32>, Decision, Vec<Action>)> {
+        let root_slot = self.inner.nodes[self.inner.root]
+            .slots
+            .iter()
+            .find(|slot| &slot.action == root_action)?;
+        let node = self.inner.nodes.get(root_slot.child?)?;
+        node.construction_context.as_ref()?;
+        Some((
+            node.semantic_path.clone(),
+            node.decision.clone(),
+            node.slots.iter().map(|slot| slot.action.clone()).collect(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_expand_construction_action_v2(
+        &mut self,
+        owner_path: &[u32],
+        action: &Action,
+    ) -> Result<(), DynamicSearchStatusV1> {
+        let Some((owner, slot)) = self
+            .inner
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(owner, node)| {
+                if node.semantic_path != owner_path || node.construction_context.is_none() {
+                    return None;
+                }
+                node.slots
+                    .iter()
+                    .position(|slot| &slot.action == action && slot.child.is_none())
+                    .map(|slot| (owner, slot))
+            })
+        else {
+            return Err(DynamicSearchStatusV1::UnresolvedWithinBudget);
+        };
+        self.expand_slot_v2(owner, slot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_result_v2(&self, status: DynamicSearchStatusV1) -> DynamicSearchResultV2 {
+        self.result_v2(status)
+    }
+    pub fn run_v2(&mut self, compute_budget: usize) -> DynamicSearchResultV2 {
+        let mut expanded = 0usize;
+        while expanded < compute_budget {
+            if !self.certified_complete_actions_v2().is_empty() {
+                break;
+            }
+            self.inner.metrics.scheduler_rebuilds += 1;
+            let Some((owner, slot)) = self.inner.next_task() else {
+                break;
+            };
+            if let Err(status) = self.expand_slot_v2(owner, slot) {
+                return self.result_v2(status);
+            }
+            expanded += 1;
+        }
+        let status = if self.certified_complete_actions_v2().is_empty() {
+            DynamicSearchStatusV1::UnresolvedWithinBudget
+        } else {
+            DynamicSearchStatusV1::Certified
+        };
+        self.result_v2(status)
+    }
+
+    fn expand_slot_v2(
+        &mut self,
+        owner: usize,
+        slot_index: usize,
+    ) -> Result<(), DynamicSearchStatusV1> {
+        let (mut state, action, depth, previous_actor) = {
+            let node = &self.inner.nodes[owner];
+            (
+                node.state.clone(),
+                node.slots[slot_index].action.clone(),
+                node_depth(&self.inner.nodes, owner) + 1,
+                node.actor
+                    .ok_or(DynamicSearchStatusV1::UnsupportedDecision)?,
+            )
+        };
+        self.inner.metrics.state_clones += 1;
+        if engine::step(&mut state, action).is_err() {
+            return Err(DynamicSearchStatusV1::UnsupportedDecision);
+        }
+        self.inner.metrics.authoritative_transitions += 1;
+        self.inner.metrics.expanded_actions += 1;
+        let decision = engine::advance_until_decision(&mut state);
+        let child = admit_v2(
+            state,
+            decision,
+            self.inner.root_player,
+            Some(owner),
+            depth,
+            &self.inner.nodes,
+            previous_actor,
+        )
+        .map_err(|error| match error.as_str() {
+            "CYCLE_DETECTED" => DynamicSearchStatusV1::UnresolvedWithinBudget,
+            _ => DynamicSearchStatusV1::UnsupportedDecision,
+        })?;
+        let mut child = child;
+        child.semantic_path = self.inner.nodes[owner].semantic_path.clone();
+        child.semantic_path.push(slot_index as u32);
+        self.inner.metrics.admitted_actions += child.slots.len() as u64;
+        let index = self.inner.nodes.len();
+        self.inner.nodes.push(child);
+        self.inner.nodes[owner].slots[slot_index].child = Some(index);
+        self.inner.recompute();
+        Ok(())
+    }
+
+    fn complete_and_incomplete_root_actions_v2(
+        &self,
+    ) -> (
+        Vec<CompletePhysicalActionV2>,
+        Vec<IncompletePhysicalActionFrontierV2>,
+    ) {
+        let mut complete = Vec::new();
+        let mut incomplete = Vec::new();
+        let root = &self.inner.nodes[self.inner.root];
+        for slot in &root.slots {
+            let responses = vec![slot.action.clone()];
+            let path_ids = vec![slot.id.clone()];
+            match slot.child {
+                Some(child) => self.collect_physical_actions_v2(
+                    child,
+                    responses,
+                    path_ids,
+                    &mut complete,
+                    &mut incomplete,
+                ),
+                None => incomplete.push(IncompletePhysicalActionFrontierV2 {
+                    stable_prefix_identity: stable_action_path_id_v2("open", &path_ids),
+                    owner_semantic_path: root.semantic_path.clone(),
+                    next_action_id: slot.id.clone(),
+                    ordered_engine_responses: responses,
+                    bounds: BoundIntervalV1::UNKNOWN,
+                }),
+            }
+        }
+        (complete, incomplete)
+    }
+
+    fn collect_physical_actions_v2(
+        &self,
+        node_index: usize,
+        responses: Vec<Action>,
+        path_ids: Vec<String>,
+        complete: &mut Vec<CompletePhysicalActionV2>,
+        incomplete: &mut Vec<IncompletePhysicalActionFrontierV2>,
+    ) {
+        let node = &self.inner.nodes[node_index];
+        if node.construction_context.is_some() {
+            for slot in &node.slots {
+                let mut next_responses = responses.clone();
+                next_responses.push(slot.action.clone());
+                let mut next_path_ids = path_ids.clone();
+                next_path_ids.push(slot.id.clone());
+                match slot.child {
+                    Some(child) => self.collect_physical_actions_v2(
+                        child,
+                        next_responses,
+                        next_path_ids,
+                        complete,
+                        incomplete,
+                    ),
+                    None => incomplete.push(IncompletePhysicalActionFrontierV2 {
+                        stable_prefix_identity: stable_action_path_id_v2("open", &next_path_ids),
+                        owner_semantic_path: node.semantic_path.clone(),
+                        next_action_id: slot.id.clone(),
+                        ordered_engine_responses: next_responses,
+                        bounds: BoundIntervalV1::UNKNOWN,
+                    }),
+                }
+            }
+            return;
+        }
+
+        let Some(finalization_boundary) = finalization_boundary_v2(node, &responses) else {
+            incomplete.push(IncompletePhysicalActionFrontierV2 {
+                stable_prefix_identity: stable_action_path_id_v2("unfinalized", &path_ids),
+                owner_semantic_path: node.semantic_path.clone(),
+                next_action_id: String::new(),
+                ordered_engine_responses: responses,
+                bounds: node.bounds,
+            });
+            return;
+        };
+        let identity = CompletePhysicalActionIdentityV2 {
+            schema_version: COMPLETE_PHYSICAL_ACTION_SCHEMA_V2,
+            initiating_decision: self.initiating_decision.clone(),
+            ordered_engine_responses: responses,
+            finalization_boundary,
+        };
+        complete.push(CompletePhysicalActionV2 {
+            stable_semantic_identity: stable_action_path_id_v2("complete", &path_ids),
+            identity,
+            bounds: node.bounds,
+        });
+    }
+
+    fn certified_complete_actions_v2(&self) -> Vec<CompletePhysicalActionV2> {
+        let (complete, incomplete) = self.complete_and_incomplete_root_actions_v2();
+        complete
+            .iter()
+            .enumerate()
+            .filter_map(|(index, action)| {
+                let competitor_upper = complete
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .map(|(_, other)| other.bounds.upper)
+                    .chain(incomplete.iter().map(|other| other.bounds.upper))
+                    .max();
+                competitor_upper
+                    .is_none_or(|upper| action.bounds.lower >= upper)
+                    .then(|| action.clone())
+            })
+            .collect()
+    }
+
+    fn result_v2(&self, status: DynamicSearchStatusV1) -> DynamicSearchResultV2 {
+        let (complete_root_actions, incomplete_root_frontier) =
+            self.complete_and_incomplete_root_actions_v2();
+        let certified_optimal_actions = self.certified_complete_actions_v2();
+        let chosen_action = certified_optimal_actions.first().cloned();
+        let root = &self.inner.nodes[self.inner.root];
+        let root_bounds = root.bounds;
+        let root_engine_actions = self
+            .inner
+            .result(DynamicSearchStatusV1::UnresolvedWithinBudget)
+            .root_actions;
+        let mut metrics = self.inner.metrics.clone();
+        metrics.root_certified = chosen_action.is_some();
+        DynamicSearchResultV2 {
+            status,
+            chosen_action,
+            certified_optimal_actions,
+            exact_root_value: (root_bounds.lower == root_bounds.upper).then_some(root_bounds.lower),
+            root_bounds,
+            root_engine_actions,
+            root_action_domain_complete: incomplete_root_frontier.is_empty(),
+            complete_root_actions,
+            incomplete_root_frontier,
+            metrics,
+        }
+    }
+}
+
+fn stable_action_path_id_v2(kind: &str, path: &[String]) -> String {
+    let mut value = format!("mads.physical-action.v{COMPLETE_PHYSICAL_ACTION_SCHEMA_V2}:{kind}");
+    for part in path {
+        value.push_str(&format!("|{}:{part}", part.len()));
+    }
+    value
+}
+
+fn finalization_boundary_v2(
+    node: &Node,
+    responses: &[Action],
+) -> Option<PhysicalActionFinalizationV2> {
+    if let Decision::GameOver { winner } = node.decision {
+        return Some(PhysicalActionFinalizationV2::Terminal { winner });
+    }
+    if node.state.engine.pending_cast.is_some() || node.state.engine.pending_activation.is_some() {
+        return None;
+    }
+    if let Some(spell) = responses.iter().find_map(|action| match action {
+        Action::CastSpell(spell) => Some(*spell),
+        _ => None,
+    }) {
+        let selected_targets = responses
+            .iter()
+            .filter_map(|action| match action {
+                Action::ChooseTarget(target) => Some(*target),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !is_supported_constructed_spell_v2(&node.state, spell) {
+            return None;
+        }
+        let finalized_binding = node.state.objects.get(spell).v4.finalized_cast_binding?;
+        let item = node
+            .state
+            .stack
+            .iter()
+            .rev()
+            .find(|item| item.source == spell && !item.is_copy)?;
+        if item.targets != selected_targets {
+            return None;
+        }
+        return Some(PhysicalActionFinalizationV2::CastFinalized {
+            source: spell,
+            stack_item: Box::new(item.clone()),
+            finalized_binding,
+        });
+    }
+    Some(PhysicalActionFinalizationV2::EngineDecisionReached(
+        node.decision.clone(),
+    ))
+}
 fn actor(d: &Decision) -> Option<PlayerId> {
     match d {
         Decision::CastSpellOrPass { player, .. } => Some(*player),
@@ -631,6 +1032,8 @@ fn admit(
     Ok(Node {
         state,
         decision,
+        actor,
+        construction_context: None,
         role: actor.map(|p| {
             if p == root {
                 MadsRoleV1::Max
@@ -642,6 +1045,125 @@ fn admit(
         parent,
         bounds,
         terminal: terminal.is_some(),
+        semantic_path: Vec::new(),
+    })
+}
+fn admit_v2(
+    state: GameState,
+    decision: Decision,
+    root: PlayerId,
+    parent: Option<usize>,
+    depth: usize,
+    ancestors: &[Node],
+    previous_actor: PlayerId,
+) -> Result<Node, String> {
+    match classify_after_transition_v1(Some(previous_actor), &state, &decision)
+        .map_err(|_| "UNSUPPORTED_DECISION".to_owned())?
+    {
+        ClassifiedDecisionV1::GameDecision { decision, .. } => {
+            admit(state, decision, root, parent, depth, ancestors)
+        }
+        ClassifiedDecisionV1::ActorSwitch {
+            kind: ActorSwitchKindV1::PriorityActorChanged,
+            decision,
+            ..
+        } => admit(state, decision, root, parent, depth, ancestors),
+        ClassifiedDecisionV1::Construction(context) => {
+            admit_construction_v2(state, *context, root, parent, depth, ancestors)
+        }
+        ClassifiedDecisionV1::Terminal { .. } => {
+            admit(state, decision, root, parent, depth, ancestors)
+        }
+        ClassifiedDecisionV1::ActorSwitch { .. } => Err("UNSUPPORTED_DECISION".to_owned()),
+    }
+}
+
+fn is_supported_constructed_spell_v2(state: &GameState, spell: ObjectId) -> bool {
+    crate::card_def::card_id_by_name("Lightning Bolt")
+        .is_some_and(|bolt| state.objects.get(spell).card_def == bolt)
+}
+
+fn construction_target_id_v2(
+    context: &DecisionConstructionV1,
+    action: &Action,
+    order: usize,
+) -> Result<String, String> {
+    let Action::ChooseTarget(target) = action else {
+        return Err("UNSUPPORTED_DECISION".to_owned());
+    };
+    let target_identity = match target {
+        Target::Player(player) => format!("player:{}", player.index()),
+        Target::Object(object) => format!("object:{}", object.0),
+    };
+    let prefix = context
+        .ordered_target_prefix
+        .iter()
+        .map(|target| match target {
+            Target::Player(player) => format!("p{}", player.index()),
+            Target::Object(object) => format!("o{}", object.0),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(
+        "PendingCastTargetV1:spell={}:prefix={prefix}:remaining={}:order={order}:{target_identity}",
+        context.pending_cast.spell.0, context.remaining_cardinality
+    ))
+}
+
+fn admit_construction_v2(
+    state: GameState,
+    context: DecisionConstructionV1,
+    root: PlayerId,
+    parent: Option<usize>,
+    depth: usize,
+    ancestors: &[Node],
+) -> Result<Node, String> {
+    if !is_supported_constructed_spell_v2(&state, context.pending_cast.spell) {
+        return Err("UNSUPPORTED_DECISION".to_owned());
+    }
+    if depth > 256 {
+        return Err("CYCLE_DETECTED".to_owned());
+    }
+    let decision = context.decision.clone();
+    let mut cursor = parent;
+    while let Some(index) = cursor {
+        let prior = &ancestors[index];
+        if prior.state == state && prior.decision == decision {
+            return Err("CYCLE_DETECTED".to_owned());
+        }
+        cursor = prior.parent;
+    }
+    let mut slots = Vec::with_capacity(context.legal_candidates.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for (order, action) in context.legal_candidates.iter().cloned().enumerate() {
+        let id = construction_target_id_v2(&context, &action, order)?;
+        if !seen.insert(id.clone()) {
+            return Err("UNSUPPORTED_DECISION".to_owned());
+        }
+        slots.push(Slot {
+            id,
+            action,
+            child: None,
+        });
+    }
+    if slots.is_empty() || slots.len() > 100_000 {
+        return Err("UNSUPPORTED_DECISION".to_owned());
+    }
+    let actor = context.initiator;
+    Ok(Node {
+        state,
+        decision,
+        actor: Some(actor),
+        construction_context: Some(Box::new(context)),
+        role: Some(if actor == root {
+            MadsRoleV1::Max
+        } else {
+            MadsRoleV1::Min
+        }),
+        slots,
+        parent,
+        bounds: BoundIntervalV1::UNKNOWN,
+        terminal: false,
         semantic_path: Vec::new(),
     })
 }
