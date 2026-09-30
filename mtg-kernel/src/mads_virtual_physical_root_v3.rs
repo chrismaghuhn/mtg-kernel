@@ -156,8 +156,16 @@ pub struct SuccessorBindingV3 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SuccessorProvenanceV3 {
-    AuthoritativeTransition { transition_identity: String },
-    OracleFixture { fixture_identity: String },
+    AuthoritativeTransition {
+        source_frame_identity: String,
+        transition_identity: String,
+        physical_response_identity: String,
+    },
+    OracleFixture {
+        domain_fixture_identity: String,
+        successor_fixture_identity: String,
+        physical_response_identity: String,
+    },
 }
 
 impl SuccessorBindingV3 {
@@ -166,11 +174,26 @@ impl SuccessorBindingV3 {
         identity: &PhysicalRootActionIdentityV3,
         admission_evidence_identity: &str,
     ) -> Result<(), VirtualPhysicalRootErrorV3> {
-        let provenance_identity = match &self.provenance {
+        let response_identity = identity.stable_semantic_id();
+        let provenance_matches = match &self.provenance {
             SuccessorProvenanceV3::AuthoritativeTransition {
+                source_frame_identity,
                 transition_identity,
-            } => transition_identity,
-            SuccessorProvenanceV3::OracleFixture { fixture_identity } => fixture_identity,
+                physical_response_identity,
+            } => {
+                source_frame_identity == admission_evidence_identity
+                    && !transition_identity.is_empty()
+                    && physical_response_identity == &response_identity
+            }
+            SuccessorProvenanceV3::OracleFixture {
+                domain_fixture_identity,
+                successor_fixture_identity,
+                physical_response_identity,
+            } => {
+                domain_fixture_identity == admission_evidence_identity
+                    && !successor_fixture_identity.is_empty()
+                    && physical_response_identity == &response_identity
+            }
         };
         if self.physical_owner_id != identity.physical_owner_id
             || self.owner_graph_node_id.is_empty()
@@ -186,8 +209,7 @@ impl SuccessorBindingV3 {
                 .collect::<BTreeSet<_>>()
                 .len()
                 != self.graph_path_node_ids.len()
-            || provenance_identity.is_empty()
-            || provenance_identity != admission_evidence_identity
+            || !provenance_matches
             || self.next_expansion_slot.as_ref().is_some_and(|slot| {
                 slot.validate(&self.physical_owner_id, slot.actor).is_err()
                     || slot.graph_owner_id != self.successor_node_id
@@ -1543,7 +1565,9 @@ mod tests {
                     ],
                     next_actor: Some(PlayerId::P1),
                     provenance: SuccessorProvenanceV3::OracleFixture {
-                        fixture_identity: nested_fixture.fixture_id.clone(),
+                        domain_fixture_identity: nested_fixture.fixture_id.clone(),
+                        successor_fixture_identity: flat_fixture.fixture_id.clone(),
+                        physical_response_identity: pass_id.clone(),
                     },
                 },
             )
@@ -1577,7 +1601,9 @@ mod tests {
                     ],
                     next_actor: Some(PlayerId::P1),
                     provenance: SuccessorProvenanceV3::OracleFixture {
-                        fixture_identity: nested_fixture.fixture_id.clone(),
+                        domain_fixture_identity: nested_fixture.fixture_id.clone(),
+                        successor_fixture_identity: flat_fixture.fixture_id.clone(),
+                        physical_response_identity: other_id.clone(),
                     },
                 },
             )
@@ -1746,7 +1772,9 @@ mod tests {
                         graph_path_node_ids: vec!["game:root".to_owned(), node.to_owned()],
                         next_actor,
                         provenance: SuccessorProvenanceV3::OracleFixture {
-                            fixture_identity: flat_fixture.fixture_id.clone(),
+                            domain_fixture_identity: flat_fixture.fixture_id.clone(),
+                            successor_fixture_identity: nested_fixture.fixture_id.clone(),
+                            physical_response_identity: id.to_owned(),
                         },
                     },
                 )
@@ -2016,7 +2044,9 @@ mod tests {
                         graph_path_node_ids: path,
                         next_actor: Some(PlayerId::P0),
                         provenance: SuccessorProvenanceV3::OracleFixture {
-                            fixture_identity: "mads03b4-flat-physical-root-v1".to_owned(),
+                            domain_fixture_identity: "mads03b4-flat-physical-root-v1".to_owned(),
+                            successor_fixture_identity: "mads03b4-flat-physical-root-v1".to_owned(),
+                            physical_response_identity: p0_id.clone(),
                         },
                     },
                 ),
@@ -2028,6 +2058,76 @@ mod tests {
                 "failed bindings are atomic"
             );
         }
+    }
+
+    #[test]
+    fn transition_identity_is_distinct_but_linked_to_source_frame_and_response() {
+        let (mut root, _, _, initial_envelope_id) = root_with_prefix();
+        let envelope_id = root
+            .advance_unresolved_prefix(
+                &initial_envelope_id,
+                vec![CAST.to_owned()],
+                slot(
+                    "construction:bolt:target-stage-0",
+                    PROTOCOL,
+                    "target-pick-stage-0",
+                    "enumerate-complete-target-domain",
+                    0,
+                    1,
+                ),
+                cast_prefix_progress(ROOT_CONTINUATION),
+            )
+            .unwrap();
+        let frame_identity = "engine-frame:decision-revision-17";
+        let domain = CompletePhysicalActionDomainV3::new(
+            domain_context(),
+            CompleteCandidateDomainAttestationV3 {
+                ordered_candidate_responses: vec![
+                    vec![CAST.to_owned(), TARGET_P0.to_owned()],
+                    vec![CAST.to_owned(), TARGET_P1.to_owned()],
+                ],
+                evidence: CompleteDomainEvidenceV3::AuthoritativeEngineFrame {
+                    frame_identity: frame_identity.to_owned(),
+                },
+            },
+            vec![
+                target_candidate(0, TARGET_P0),
+                target_candidate(1, TARGET_P1),
+            ],
+        )
+        .unwrap();
+        let p0_id = root.admit_complete_domain(&envelope_id, domain).unwrap()[0].clone();
+        let responses = vec![CAST.to_owned(), TARGET_P0.to_owned()];
+        let make_binding = |source_frame_identity: &str| SuccessorBindingV3 {
+            physical_owner_id: OWNER.to_owned(),
+            owner_graph_node_id: "game:root".to_owned(),
+            ordered_engine_responses: responses.clone(),
+            finalization_boundary: "cast-finalized".to_owned(),
+            successor_node_id: "engine-successor:2".to_owned(),
+            next_expansion_slot: None,
+            graph_path_node_ids: vec!["game:root".to_owned(), "engine-successor:2".to_owned()],
+            next_actor: Some(PlayerId::P0),
+            provenance: SuccessorProvenanceV3::AuthoritativeTransition {
+                source_frame_identity: source_frame_identity.to_owned(),
+                transition_identity: "engine-transition:91".to_owned(),
+                physical_response_identity: p0_id.clone(),
+            },
+        };
+        assert_ne!(frame_identity, "engine-transition:91");
+        assert_eq!(
+            root.complete_alternative(&p0_id, &responses, make_binding("other-frame")),
+            Err(VirtualPhysicalRootErrorV3::InvalidSuccessorBinding)
+        );
+        assert_eq!(
+            root.alternatives[&p0_id].state,
+            PhysicalAlternativeStateV3::PartiallyConstructed
+        );
+        root.complete_alternative(&p0_id, &responses, make_binding(frame_identity))
+            .unwrap();
+        assert_eq!(
+            root.alternatives[&p0_id].state,
+            PhysicalAlternativeStateV3::Completed
+        );
     }
 
     #[test]
@@ -2075,7 +2175,9 @@ mod tests {
                 graph_path_node_ids: vec!["game:root".to_owned(), "oracle-successor:2".to_owned()],
                 next_actor: Some(PlayerId::P0),
                 provenance: SuccessorProvenanceV3::OracleFixture {
-                    fixture_identity: "mads03b4-flat-physical-root-v1".to_owned(),
+                    domain_fixture_identity: "mads03b4-flat-physical-root-v1".to_owned(),
+                    successor_fixture_identity: "mads03b4-successor-values-v1".to_owned(),
+                    physical_response_identity: p0_id.clone(),
                 },
             },
         )
@@ -2258,7 +2360,9 @@ mod tests {
                     graph_path_node_ids: vec!["game:root".to_owned(), successor.to_owned()],
                     next_actor: Some(PlayerId::P1),
                     provenance: SuccessorProvenanceV3::OracleFixture {
-                        fixture_identity: "frontier-status-fixture".to_owned(),
+                        domain_fixture_identity: "frontier-status-fixture".to_owned(),
+                        successor_fixture_identity: "frontier-successors-fixture".to_owned(),
+                        physical_response_identity: id.to_owned(),
                     },
                 },
             )
