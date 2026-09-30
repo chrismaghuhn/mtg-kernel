@@ -6487,6 +6487,23 @@ fn _assert_game_object_is_visible_data(_: &GameObject) {}
 #[cfg(test)]
 mod policy_v5_artifact_tests {
     use super::*;
+    #[test]
+    fn hidden_opponent_library_order_changes_game_state_but_not_p0_observation() {
+        let state = GameState::new_from_libraries(&[1, 2], &[3, 4], card_name, 99);
+        let mut hidden_permutation = state.clone();
+        hidden_permutation.players[PlayerId::P1.index()]
+            .library
+            .swap(0, 1);
+        assert_ne!(state, hidden_permutation);
+
+        let surface = PolicySurfaceV5::new();
+        let state_observation = observe_policy_v5(&state, &surface, PlayerId::P0, 0, 0, 0, 1)
+            .expect("build P0 observation for original hidden order");
+        let permuted_observation =
+            observe_policy_v5(&hidden_permutation, &surface, PlayerId::P0, 0, 0, 0, 1)
+                .expect("build P0 observation for permuted opponent library");
+        assert_eq!(state_observation, permuted_observation);
+    }
     use crate::card_def::card_id_by_name;
     use crate::policy_surface_v5::PolicySurfaceV5;
     use crate::state::{Counters, ObjectStateV4, Step};

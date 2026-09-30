@@ -30,11 +30,12 @@ The test-only `exact_contract_sensitivity_covers_hidden_rng_history_and_continua
 - Different committed event history.
 - Different typed construction protocol stage.
 
-Existing tests in `mads_decision_state_key_v1.rs` also distinguish namespace source/rules/card/schema/surface/RNG/scheduler/key versions, raw Decision actor, ordered candidate reordering, construction prefix, and session revision. Existing FastActor preflight tests reject a stale revision, an incomplete candidate snapshot, policy-only contexts, and the missing namespace contract. These are structural/admission negatives; they do not establish safe transposition reuse or T8.
+Existing tests in `mads_decision_state_key_v1.rs` also distinguish namespace source/rules/card/schema/surface/RNG/scheduler/key versions, raw Decision actor, ordered candidate reordering, construction prefix, and session revision. Existing FastActor preflight tests reject a stale revision, an incomplete candidate snapshot, policy-only contexts, and the missing namespace contract. The additional `rl::policy_v5_artifact_tests::hidden_opponent_library_order_changes_game_state_but_not_p0_observation` builds P0 observations from a real pair of states that differ only in P1 hidden library order: the states compare unequal while the complete P0 observations compare equal. These are structural/admission negatives; they do not establish safe transposition reuse or T8.
 
 ## Verification
 
 - `cargo test --locked -p mtg-kernel --lib mads_decision_state_key_v1 -j 3 -- --nocapture` — 4 passed on the modified test module.
+- `cargo test --locked -p mtg-kernel --lib hidden_opponent_library_order_changes_game_state_but_not_p0_observation -j 3 -- --nocapture` — 1 passed; P0 ObservationV5 was equal for states with different P1 library order.
 - The main-branch FastActor preflight regressions were not rerun because production preflight code was not changed; their previous 03A evidence is recorded in `MADS03A_POST_MERGE_INTEGRATION_STATUS.md`.
 - No Engine, FastActor production code, key issuance, hash table, or namespace gate was changed. No workspace or Release suite was run.
 
