@@ -1131,6 +1131,8 @@ fn mads03b5_public_v3_binds_authoritative_bolt_target_and_pass_responses() {
         v2_result.status,
         DynamicSearchStatusV1::UnresolvedWithinBudget
     );
+    assert_eq!(v2_result.metrics.authoritative_transitions, 4);
+    assert_eq!(v2_result.metrics.state_clones, 5);
     let normalize = |paths: Vec<Vec<Action>>| {
         let mut keys = paths
             .into_iter()
@@ -1221,6 +1223,314 @@ fn mads03b5_rejects_the_entire_unsupported_fireblast_root_domain() {
         "V3 rejects the whole domain when its cast protocol is outside admission"
     );
     assert_eq!(root, before);
+}
+
+#[test]
+fn mads04_end_to_end_search_propagates_real_terminal_successors_to_physical_roots() {
+    use crate::dynamic_engine_search_v1::{DynamicEngineSearchV2, DynamicSearchStatusV1};
+    use crate::mads03b5_engine_binding_v3::DynamicEngineSearchV3;
+    use crate::mads04_end_to_end_dynamic_search_v4::{
+        DynamicEngineSearchV4, DynamicSearchStatusV4, SuccessorSearchStateV4,
+    };
+
+    let mut root = protocol_empty_state(0x0400_0001);
+    root.turn = 1;
+    root.step = Step::Main1;
+    root.active_player = PlayerId::P0;
+    root.priority_player = PlayerId::P0;
+    root.players[PlayerId::P0.index()].life = 3;
+    root.players[PlayerId::P1.index()].life = 3;
+    root.players[PlayerId::P0.index()].mana_pool[3] = 1;
+    let bolt = fixture_object(&mut root, PlayerId::P0, "Lightning Bolt", Zone::Hand);
+    let root_before = root.clone();
+    let root_decision = engine::advance_until_decision(&mut root);
+
+    let mut v2 = DynamicEngineSearchV2::new(&root, root_decision.clone()).unwrap();
+    let v2_result = v2.run_v2(8);
+    assert_eq!(
+        v2_result.status,
+        DynamicSearchStatusV1::UnresolvedWithinBudget
+    );
+    let mut v3 = DynamicEngineSearchV3::new(&root, root_decision.clone()).unwrap();
+    let v3_result = v3.run_v3(8).unwrap();
+    assert!(v3_result.root_domain_complete);
+    assert!(v3_result.certified_optimal_actions.is_empty());
+    assert_eq!(
+        v3_result.root_bounds,
+        crate::mads_v1::BoundIntervalV1::UNKNOWN
+    );
+    assert_eq!(v3_result.metrics.authoritative_transitions, 6);
+    assert_eq!(v3_result.metrics.state_clones, 13);
+
+    let mut search = DynamicEngineSearchV4::new(&root, root_decision).unwrap();
+    let zero_budget = search.run_v4(0).unwrap();
+    assert_eq!(zero_budget.metrics.authoritative_transitions, 0);
+    assert_eq!(
+        zero_budget.root_bounds,
+        crate::mads_v1::BoundIntervalV1::UNKNOWN
+    );
+    assert!(zero_budget.certified_optimal_actions.is_empty());
+
+    let mut result = zero_budget;
+    for _ in 0..32 {
+        if result.status == DynamicSearchStatusV4::ExactRootValue {
+            break;
+        }
+        result = search.run_v4(1).unwrap();
+        assert!(
+            result.root_bounds.lower <= 1 && 1 <= result.root_bounds.upper,
+            "every expansion prefix must retain the actual P0-winning root value"
+        );
+        for (responses, oracle_value) in [
+            (
+                vec![
+                    Action::CastSpell(bolt),
+                    Action::ChooseTarget(Target::Player(PlayerId::P0)),
+                ],
+                -1,
+            ),
+            (
+                vec![
+                    Action::CastSpell(bolt),
+                    Action::ChooseTarget(Target::Player(PlayerId::P1)),
+                ],
+                1,
+            ),
+        ] {
+            if let Some(action) = result
+                .physical_root_actions
+                .iter()
+                .find(|action| action.ordered_engine_responses == responses)
+            {
+                assert!(action.bounds.lower <= oracle_value && oracle_value <= action.bounds.upper,
+                    "root alternative {:?} interval {:?} excludes authoritative terminal value {oracle_value}", responses, action.bounds);
+            }
+        }
+        for certified_id in &result.certified_optimal_actions {
+            let certified = result
+                .physical_root_actions
+                .iter()
+                .find(|action| &action.stable_identity == certified_id)
+                .unwrap();
+            assert_eq!(
+                certified.ordered_engine_responses,
+                [
+                    Action::CastSpell(bolt),
+                    Action::ChooseTarget(Target::Player(PlayerId::P1))
+                ],
+                "any MADS-04 real-engine root certificate must be oracle-optimal in this fixture"
+            );
+        }
+    }
+    assert_eq!(
+        result.status,
+        DynamicSearchStatusV4::ExactRootValue,
+        "bounds={:?}, certs={:?}, actions={:?}, blocked={:?}",
+        result.root_bounds,
+        result.certified_optimal_actions,
+        result
+            .physical_root_actions
+            .iter()
+            .map(|action| (&action.ordered_engine_responses, action.bounds))
+            .collect::<Vec<_>>(),
+        result.unresolved_reasons,
+    );
+    assert_eq!(result.exact_root_value, Some(1));
+    assert_eq!(
+        result.root_bounds,
+        crate::mads_v1::BoundIntervalV1::exact(1)
+    );
+    assert_eq!(result.physical_root_actions.len(), 3);
+    assert_eq!(result.certified_optimal_actions.len(), 1);
+    assert!(result.root_frontier.status == crate::mads_virtual_physical_root_v3::RootCriticalFrontierStatusV3::Ready
+        || result.root_frontier.status == crate::mads_virtual_physical_root_v3::RootCriticalFrontierStatusV3::ReadyAndBlockedOnUnevaluatedSuccessor);
+
+    let target_p0 = result
+        .physical_root_actions
+        .iter()
+        .find(|action| {
+            action.ordered_engine_responses
+                == [
+                    Action::CastSpell(bolt),
+                    Action::ChooseTarget(Target::Player(PlayerId::P0)),
+                ]
+        })
+        .unwrap();
+    let target_p1 = result
+        .physical_root_actions
+        .iter()
+        .find(|action| {
+            action.ordered_engine_responses
+                == [
+                    Action::CastSpell(bolt),
+                    Action::ChooseTarget(Target::Player(PlayerId::P1)),
+                ]
+        })
+        .unwrap();
+    let pass = result
+        .physical_root_actions
+        .iter()
+        .find(|action| action.ordered_engine_responses == [Action::Pass])
+        .unwrap();
+    assert_eq!(target_p0.bounds, crate::mads_v1::BoundIntervalV1::exact(-1));
+    assert_eq!(target_p1.bounds, crate::mads_v1::BoundIntervalV1::exact(1));
+    assert_eq!(pass.bounds, crate::mads_v1::BoundIntervalV1::UNKNOWN);
+    assert_eq!(
+        target_p0.successor_search_state,
+        SuccessorSearchStateV4::Solved
+    );
+    assert_eq!(
+        target_p1.successor_search_state,
+        SuccessorSearchStateV4::Solved
+    );
+    assert_eq!(
+        result.certified_optimal_actions.as_slice(),
+        std::slice::from_ref(&target_p1.stable_identity)
+    );
+    assert_eq!(result.metrics.physical_construction_units, 4);
+    assert_eq!(result.metrics.successor_expansion_attempts, 4);
+    assert_eq!(result.metrics.search_expansion_units, 8);
+    assert_eq!(result.metrics.authoritative_transitions, 10);
+    assert_eq!(result.metrics.state_clones, 20);
+    assert_eq!(result.metrics.expansions_to_first_certificate, Some(8));
+    assert_eq!(result.metrics.complete_physical_actions, 3);
+    assert_eq!(result.metrics.unknown_root_alternatives, 1);
+    assert_eq!(result.metrics.root_alternative_count, 3);
+    assert_eq!(result.metrics.successor_game_decisions_admitted, 2);
+    assert_eq!(result.metrics.successor_terminal_nodes_admitted, 2);
+    assert_eq!(result.metrics.successor_construction_nodes_admitted, 0);
+    assert_eq!(result.metrics.successor_domains_revalidated, 3);
+    assert_eq!(result.metrics.successor_domains_admitted_by_v3, 3);
+    assert_eq!(result.metrics.max_decision_nodes, 2);
+    assert_eq!(
+        result.metrics.min_decision_nodes, 3,
+        "the P1 priority successors remain MIN under the fixed P0 root perspective"
+    );
+    println!(
+        "MADS04_REAL_TERMINAL seed=0x04000001 expansions={} transitions={} clones={} frontier_rebuilds={} root_bounds={:?} certified={} unknown={}/{} init_wall={:?} successor_init_wall={:?} search_wall_including_setup={:?} cpu=not_measured peak_memory=not_measured",
+        result.metrics.search_expansion_units,
+        result.metrics.authoritative_transitions,
+        result.metrics.state_clones,
+        result.metrics.frontier_rebuilds,
+        result.root_bounds,
+        result.certified_optimal_actions.len(),
+        result.metrics.unknown_root_alternatives,
+        result.metrics.root_alternative_count,
+        result.metrics.initialization_wall_time,
+        result.metrics.successor_initialization_wall_time,
+        result.metrics.search_wall_time,
+    );
+
+    let normalize = |paths: Vec<Vec<Action>>| {
+        let mut ids = paths
+            .into_iter()
+            .map(|path| {
+                path.iter()
+                    .map(|action| format!("{action:?}"))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    let expected_v4 = normalize(
+        result
+            .physical_root_actions
+            .iter()
+            .map(|action| action.ordered_engine_responses.clone())
+            .collect(),
+    );
+    assert_eq!(
+        expected_v4,
+        normalize(
+            v3_result
+                .physical_alternatives
+                .iter()
+                .map(|action| action.ordered_engine_responses.clone())
+                .collect()
+        )
+    );
+    let resumed = search.run_v4(8).unwrap();
+    assert_eq!(resumed.metrics.search_expansion_units, 8);
+    assert_eq!(
+        resumed.metrics.authoritative_transitions, 10,
+        "resuming after a root certificate must not replay completed responses"
+    );
+    assert_eq!(resumed.exact_root_value, Some(1));
+    assert_eq!(
+        expected_v4,
+        normalize(
+            v2_result
+                .complete_root_actions
+                .iter()
+                .map(|action| action.identity.ordered_engine_responses.clone())
+                .collect()
+        )
+    );
+    assert_eq!(
+        root, root_before,
+        "all physical and successor transitions use owned clones"
+    );
+}
+
+#[test]
+fn mads04_unsupported_successor_construction_stays_unknown_and_blocks_the_frontier() {
+    use crate::mads04_end_to_end_dynamic_search_v4::{
+        DynamicEngineSearchV4, DynamicSearchStatusV4, SuccessorSearchStateV4,
+    };
+
+    let mut root = protocol_empty_state(0x0400_0002);
+    root.turn = 1;
+    root.step = Step::Main1;
+    root.active_player = PlayerId::P0;
+    root.priority_player = PlayerId::P0;
+    root.players[PlayerId::P0.index()].mana_pool[3] = 1;
+    let bolt = fixture_object(&mut root, PlayerId::P0, "Lightning Bolt", Zone::Hand);
+    for _ in 0..6 {
+        fixture_object(&mut root, PlayerId::P1, "Mountain", Zone::Battlefield);
+    }
+    fixture_object(&mut root, PlayerId::P1, "Fireblast", Zone::Hand);
+    let root_before = root.clone();
+    let decision = engine::advance_until_decision(&mut root);
+    assert!(
+        matches!(&decision, Decision::CastSpellOrPass { castable_spells, .. } if castable_spells.as_slice() == [bolt]),
+        "the P0 root remains inside the admitted Bolt+Pass raw domain"
+    );
+    let mut search = DynamicEngineSearchV4::new(&root, decision).unwrap();
+    let result = search.run_v4(16).unwrap();
+    assert_eq!(
+        result.status,
+        DynamicSearchStatusV4::BlockedOnUnsupportedSuccessor
+    );
+    assert_eq!(result.root_bounds, crate::mads_v1::BoundIntervalV1::UNKNOWN);
+    assert_eq!(
+        result.root_frontier.status,
+        crate::mads_virtual_physical_root_v3::RootCriticalFrontierStatusV3::BlockedOnUnevaluatedSuccessor
+    );
+    assert!(result.certified_optimal_actions.is_empty());
+    assert_eq!(
+        result.metrics.successor_domains_revalidated, 3,
+        "the successor V1 adapter independently revalidates every exact priority frame"
+    );
+    assert!(result.metrics.successor_domains_admitted_by_v3 < 3,
+        "V3 leaves the P1 Fireblast priority candidate domain unadmitted; it is searched only by the bounded V1 adapter");
+    assert!(result
+        .unresolved_reasons
+        .values()
+        .any(|reason| reason.contains("UNSUPPORTED")));
+    assert!(result
+        .physical_root_actions
+        .iter()
+        .filter(|action| action.ordered_engine_responses.first() == Some(&Action::CastSpell(bolt)))
+        .all(
+            |action| action.bounds == crate::mads_v1::BoundIntervalV1::UNKNOWN
+                && action.successor_search_state == SuccessorSearchStateV4::Blocked
+        ));
+    assert_eq!(
+        root, root_before,
+        "unsupported successor exploration cannot mutate the caller's state"
+    );
 }
 #[test]
 fn dynamic_v2_fails_closed_for_out_of_scope_fireblast_construction() {

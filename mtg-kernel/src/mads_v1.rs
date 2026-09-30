@@ -1108,7 +1108,9 @@ fn fixture_key_lookup_v1<S: BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oracle_suite_v1::{OracleNodeV1, OracleResultV1};
+    use crate::oracle_suite_v1::{
+        OracleNodeV1, OracleResultV1, MAX_COMPLETE_LEGAL_ACTIONS_PER_GAME_NODE_V1,
+    };
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasherDefault, Hasher};
 
@@ -1141,6 +1143,163 @@ mod tests {
             id: FixtureNodeId(id),
             outcome,
         }
+    }
+
+    fn mads04_nested_and_physical_oracles() -> (OracleFixtureV1, OracleFixtureV1) {
+        let continuations = vec![
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(2),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "min-win", 6), edge(1, "min-loss", 7)],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(3),
+                actor: FixturePlayerV1::P0,
+                actions: vec![edge(0, "max-loss", 8), edge(1, "max-win", 9)],
+            },
+            terminal(4, FixtureOutcomeV1::Draw),
+            terminal(5, FixtureOutcomeV1::Draw),
+            terminal(6, FixtureOutcomeV1::Win),
+            terminal(7, FixtureOutcomeV1::Loss),
+            terminal(8, FixtureOutcomeV1::Loss),
+            terminal(9, FixtureOutcomeV1::Win),
+        ];
+        let nested = fixture(
+            vec![
+                edge(0, "cast-bolt", 1),
+                edge(1, "pass", 4),
+                edge(2, "other", 5),
+            ],
+            vec![OracleNodeV1::DecisionConstruction {
+                id: FixtureNodeId(1),
+                owner_decision: FixtureNodeId(0),
+                actor: FixturePlayerV1::P0,
+                protocol_key: "bolt-target-v1".to_owned(),
+                partial_response: "cast-bolt".to_owned(),
+                continuation_cursor: 1,
+                choices: vec![edge(0, "target-P0", 2), edge(1, "target-P1", 3)],
+            }]
+            .into_iter()
+            .chain(continuations.clone())
+            .collect(),
+        );
+        let physical = fixture(
+            vec![
+                edge(0, "bolt/target-P0", 2),
+                edge(1, "bolt/target-P1", 3),
+                edge(2, "pass", 4),
+                edge(3, "other", 5),
+            ],
+            continuations,
+        );
+        (nested, physical)
+    }
+
+    fn mads04_wall_budget_fixture() -> OracleFixtureV1 {
+        let mut root_actions = vec![
+            edge(0, "bolt/target-P0", 2),
+            edge(1, "bolt/target-P1", 3),
+            edge(2, "pass", 4),
+        ];
+        let mut nodes = vec![
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(2),
+                actor: FixturePlayerV1::P1,
+                actions: vec![edge(0, "min-win", 6), edge(1, "min-loss", 7)],
+            },
+            OracleNodeV1::GameDecision {
+                id: FixtureNodeId(3),
+                actor: FixturePlayerV1::P0,
+                actions: vec![edge(0, "max-loss", 8), edge(1, "max-win", 9)],
+            },
+            terminal(4, FixtureOutcomeV1::Draw),
+            terminal(6, FixtureOutcomeV1::Win),
+            terminal(7, FixtureOutcomeV1::Loss),
+            terminal(8, FixtureOutcomeV1::Loss),
+            terminal(9, FixtureOutcomeV1::Win),
+        ];
+        let distractor_count = MAX_COMPLETE_LEGAL_ACTIONS_PER_GAME_NODE_V1 - root_actions.len();
+        for distractor in 0..distractor_count {
+            let child_id = 1_000 + distractor as u32;
+            root_actions.push(edge(
+                (root_actions.len()) as u32,
+                &format!("draw-distractor-{distractor}"),
+                child_id,
+            ));
+            let mut draw_actions = Vec::new();
+            for choice in 0..32u32 {
+                let terminal_id = 10_000 + distractor as u32 * 32 + choice;
+                draw_actions.push(edge(
+                    choice,
+                    &format!("draw-{distractor}-{choice}"),
+                    terminal_id,
+                ));
+                nodes.push(terminal(terminal_id, FixtureOutcomeV1::Draw));
+            }
+            nodes.push(OracleNodeV1::GameDecision {
+                id: FixtureNodeId(child_id),
+                actor: FixturePlayerV1::P1,
+                actions: draw_actions,
+            });
+        }
+        fixture(root_actions, nodes)
+    }
+
+    /// Deterministic FIFO reference: graph-node admission order, then the
+    /// original complete action order at that node. Uses the same MADS graph,
+    /// bound backup, and exact fixture transition as the root-critical policy.
+    fn expand_next_fifo_v1(graph: &mut MadsGraphV1<'_>) -> Result<bool, MadsErrorV1> {
+        let next = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(owner_index, node)| {
+                node.slots()
+                    .iter()
+                    .position(|slot| slot.child.is_none())
+                    .map(|slot_index| (owner_index, slot_index))
+            });
+        let Some((owner_index, slot_index)) = next else {
+            return Ok(false);
+        };
+        let owner_node = &graph.nodes[owner_index];
+        let owner = owner_node.fixture_key();
+        let slot = owner_node.slots()[slot_index].clone();
+        let semantic_order = match graph.fixture_nodes.get(&owner).copied() {
+            Some(OracleNodeV1::DecisionConstruction {
+                protocol_key,
+                partial_response,
+                continuation_cursor,
+                ..
+            }) => ExpansionSemanticOrderV1::Construction {
+                protocol_key: protocol_key.clone(),
+                partial_response: partial_response.clone(),
+                continuation_cursor: *continuation_cursor,
+                action_order: slot.order,
+            },
+            _ => ExpansionSemanticOrderV1::GameAction {
+                action_order: slot.order,
+            },
+        };
+        let task = ExpansionTaskV1 {
+            owner,
+            action_order: slot.order,
+            action_id: slot.stable_id,
+            child: slot.child_fixture_id,
+            role_mask: ExpansionRoleMaskV1::default(),
+            root_action_support: Vec::new(),
+            bound_width: owner_node.bounds().width(),
+            min_root_distance: 0,
+            estimated_cost_bucket: slot.cost_bucket,
+            owner_semantic_path: graph
+                .semantic_path_by_fixture_id
+                .get(&owner)
+                .cloned()
+                .unwrap_or_default(),
+            construction_key_or_action_order: semantic_order,
+        };
+        graph.expand_task(&task)?;
+        Ok(true)
     }
 
     fn oracle(fixture: &OracleFixtureV1) -> OracleResultV1 {
@@ -2066,5 +2225,169 @@ mod tests {
             tree_result.metrics.valid_tt_hits,
             dag_result.root_bounds.lower,
         );
+    }
+
+    #[test]
+    fn mads04_fifo_and_root_critical_match_oracle_on_nested_physical_actions() {
+        let (nested, physical) = mads04_nested_and_physical_oracles();
+        let nested_truth = oracle(&nested);
+        let truth = oracle(&physical);
+        assert_eq!(nested_truth.root_value, truth.root_value);
+        assert_eq!(truth.root_value, WIN_V1);
+        assert_eq!(
+            truth.complete_legal_root_actions,
+            ["bolt/target-P0", "bolt/target-P1", "pass", "other"]
+        );
+        assert_eq!(truth.optimal_root_actions, ["bolt/target-P1"]);
+        assert_eq!(
+            truth.node_values[&FixtureNodeId(2)],
+            LOSS_V1,
+            "the target-P0 branch is a MIN decision and chooses its loss"
+        );
+        assert_eq!(
+            truth.node_values[&FixtureNodeId(3)],
+            WIN_V1,
+            "the target-P1 branch is a MAX decision and chooses its win"
+        );
+        assert_eq!(truth.node_values[&FixtureNodeId(4)], DRAW_V1);
+        assert_eq!(truth.node_values[&FixtureNodeId(5)], DRAW_V1);
+
+        let mut critical_to_certificate = MadsGraphV1::new(&physical).unwrap();
+        let critical_result = critical_to_certificate.run_v1(256).unwrap();
+        assert_eq!(critical_result.status, CertificationStatusV1::Certified);
+        assert!(truth
+            .optimal_root_actions
+            .contains(critical_result.chosen_action.as_ref().unwrap()));
+        let critical_first_certificate = critical_result.metrics.expanded_actions;
+
+        let mut fifo_to_certificate = MadsGraphV1::new(&physical).unwrap();
+        let mut fifo_first_certificate = None;
+        for _ in 0..256 {
+            if !fifo_to_certificate.certified_root_actions().is_empty() {
+                fifo_first_certificate = Some(fifo_to_certificate.metrics.expanded_actions);
+                break;
+            }
+            if !expand_next_fifo_v1(&mut fifo_to_certificate).unwrap() {
+                break;
+            }
+            assert_graph_intervals_contain_oracle(&fifo_to_certificate, &truth);
+        }
+        let fifo_first_certificate =
+            fifo_first_certificate.expect("FIFO reaches a valid oracle certificate");
+        assert!(fifo_to_certificate
+            .certified_root_actions()
+            .iter()
+            .all(|action| truth.optimal_root_actions.contains(action)));
+
+        let mut critical_full = MadsGraphV1::new(&physical).unwrap();
+        while critical_full.expand_next_v1().unwrap().is_some() {
+            assert_graph_intervals_contain_oracle(&critical_full, &truth);
+        }
+        let mut fifo_full = MadsGraphV1::new(&physical).unwrap();
+        while expand_next_fifo_v1(&mut fifo_full).unwrap() {
+            assert_graph_intervals_contain_oracle(&fifo_full, &truth);
+        }
+        let critical_final = critical_full.result_v1();
+        let fifo_final = fifo_full.result_v1();
+        assert_eq!(critical_final.root_bounds, BoundIntervalV1::exact(WIN_V1));
+        assert_eq!(fifo_final.root_bounds, critical_final.root_bounds);
+        assert_eq!(
+            critical_final.certified_optimal_actions,
+            fifo_final.certified_optimal_actions
+        );
+        assert!(critical_final
+            .certified_optimal_actions
+            .iter()
+            .all(|action| truth.optimal_root_actions.contains(action)));
+
+        println!(
+            "MADS04_ORACLE_ABLATION fifo_first_certificate_expansions={fifo_first_certificate} root_critical_first_certificate_expansions={critical_first_certificate} fifo_total_expansions={} root_critical_total_expansions={} fifo_frontier_rebuilds=0 root_critical_frontier_rebuilds={} root_value={} fixture_only=true",
+            fifo_final.metrics.expanded_actions,
+            critical_final.metrics.expanded_actions,
+            critical_final.metrics.frontier_rebuilds,
+            critical_final.root_bounds.lower,
+        );
+    }
+
+    #[test]
+    fn mads04_fifo_and_root_critical_use_the_same_controlled_wall_budget() {
+        let fixture = mads04_wall_budget_fixture();
+        let truth = oracle(&fixture);
+        assert_eq!(truth.root_value, WIN_V1);
+        assert_eq!(
+            truth.complete_legal_root_actions.len(),
+            MAX_COMPLETE_LEGAL_ACTIONS_PER_GAME_NODE_V1
+        );
+        let wall_budget = Duration::from_millis(5);
+
+        let mut fifo = MadsGraphV1::new(&fixture).unwrap();
+        let fifo_start = std::time::Instant::now();
+        while fifo_start.elapsed() < wall_budget && fifo.certified_root_actions().is_empty() {
+            if !expand_next_fifo_v1(&mut fifo).unwrap() {
+                break;
+            }
+            let interval = fifo.root_bounds();
+            assert!(interval.lower <= truth.root_value && truth.root_value <= interval.upper);
+        }
+        let fifo_elapsed = fifo_start.elapsed();
+        assert!(fifo
+            .certified_root_actions()
+            .iter()
+            .all(|action| truth.optimal_root_actions.contains(action)));
+
+        let mut critical = MadsGraphV1::new(&fixture).unwrap();
+        let critical_start = std::time::Instant::now();
+        while critical_start.elapsed() < wall_budget && critical.certified_root_actions().is_empty()
+        {
+            if critical.expand_next_v1().unwrap().is_none() {
+                break;
+            }
+            let interval = critical.root_bounds();
+            assert!(interval.lower <= truth.root_value && truth.root_value <= interval.upper);
+        }
+        let critical_elapsed = critical_start.elapsed();
+        assert!(critical
+            .certified_root_actions()
+            .iter()
+            .all(|action| truth.optimal_root_actions.contains(action)));
+
+        println!(
+            "MADS04_CONTROLLED_WALL_ABLATION budget_ms=5 fifo_elapsed_us={} fifo_expansions={} fifo_certificate={} root_critical_elapsed_us={} root_critical_expansions={} root_critical_certificate={} oracle_root_value={} fixture_only=true",
+            fifo_elapsed.as_micros(),
+            fifo.metrics.expanded_actions,
+            !fifo.certified_root_actions().is_empty(),
+            critical_elapsed.as_micros(),
+            critical.metrics.expanded_actions,
+            !critical.certified_root_actions().is_empty(),
+            truth.root_value,
+        );
+    }
+
+    fn assert_graph_intervals_contain_oracle(graph: &MadsGraphV1<'_>, oracle: &OracleResultV1) {
+        for node in &graph.nodes {
+            let value = oracle.node_values[&node.fixture_key()];
+            assert!(
+                node.bounds().lower <= value && value <= node.bounds().upper,
+                "fixture node {} interval {:?} excludes oracle value {value}",
+                node.fixture_key().0,
+                node.bounds()
+            );
+        }
+        let root_bounds = graph.root_bounds();
+        assert!(root_bounds.lower <= oracle.root_value && oracle.root_value <= root_bounds.upper);
+        for action in graph.root_action_bounds_v1() {
+            let slot = graph.nodes[graph.root_index]
+                .slots()
+                .iter()
+                .find(|slot| slot.order == action.order)
+                .unwrap();
+            let value = oracle.node_values[&slot.child_fixture_id];
+            assert!(
+                action.bounds.lower <= value && value <= action.bounds.upper,
+                "root action {} interval {:?} excludes oracle value {value}",
+                action.stable_id,
+                action.bounds
+            );
+        }
     }
 }

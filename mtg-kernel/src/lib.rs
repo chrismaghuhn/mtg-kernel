@@ -100,6 +100,8 @@ pub mod mads_decision_state_key_v1;
 // It is not integrated into DynamicEngineSearchV1; incomplete actions cannot be certified.
 /// Authoritative, path-local Engine binding for the admitted MADS-03B5 Bolt/Pass scope.
 pub mod mads03b5_engine_binding_v3;
+/// End-to-end, path-local successor value search over V3 physical roots.
+pub mod mads04_end_to_end_dynamic_search_v4;
 #[allow(dead_code)]
 pub(crate) mod mads_decision_construction_v1;
 pub mod mads_virtual_physical_root_v3;

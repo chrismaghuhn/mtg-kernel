@@ -201,6 +201,20 @@ struct DynamicExpansionTask {
     owner_semantic_path: Vec<u32>,
 }
 
+/// Crate-internal, path-local task view used by MADS-04 to schedule one exact
+/// V1 Engine expansion under an outer physical-root role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DynamicSearchTaskDescriptorV1 {
+    pub owner_semantic_path: Vec<u32>,
+    pub action_order: u32,
+    pub action_id: String,
+    pub actor: PlayerId,
+    pub role_mask: u8,
+    pub bound_width: u8,
+    pub min_root_distance: u16,
+    pub estimated_cost_bucket: u16,
+}
+
 impl DynamicExpansionTask {
     fn sort_key(&self) -> DynamicFrontierSortKeyV1 {
         dynamic_path_frontier_sort_key_v1(
@@ -223,12 +237,15 @@ pub struct DynamicEngineSearchV1 {
     nodes: Vec<Node>,
     root: usize,
     root_player: PlayerId,
+    successor_value_mode: bool,
     metrics: DynamicSearchMetricsV1,
 }
 
 impl DynamicEngineSearchV1 {
     pub const API_VERSION: u16 = 1;
     pub const FRONTIER_POLICY: &'static str = "FRONTIER_REBUILD_DYNAMIC_PATH_V1";
+    pub(crate) const SUCCESSOR_VALUE_FRONTIER_POLICY_V1: &'static str =
+        "FRONTIER_REBUILD_SUCCESSOR_VALUE_V1";
     pub const SUPPORTED_DECISION_KINDS: &'static [&'static str] =
         &["CastSpellOrPass", "DeclareAttackers(empty)", "GameOver"];
 
@@ -326,6 +343,25 @@ impl DynamicEngineSearchV1 {
         root_decision: Decision,
     ) -> Result<Self, DynamicSearchErrorV1> {
         let root_player = actor(&root_decision).ok_or(DynamicSearchErrorV1::UnsupportedDecision)?;
+        Self::new_with_root_player_mode_v1(root_state, root_decision, root_player, false)
+    }
+
+    /// Additive internal constructor for a local successor search whose MAX
+    /// perspective remains the original physical-search root player.
+    pub(crate) fn new_with_root_player_v1(
+        root_state: &GameState,
+        root_decision: Decision,
+        root_player: PlayerId,
+    ) -> Result<Self, DynamicSearchErrorV1> {
+        Self::new_with_root_player_mode_v1(root_state, root_decision, root_player, true)
+    }
+
+    fn new_with_root_player_mode_v1(
+        root_state: &GameState,
+        root_decision: Decision,
+        root_player: PlayerId,
+        successor_value_mode: bool,
+    ) -> Result<Self, DynamicSearchErrorV1> {
         let mut root_binding = root_state.clone();
         let authoritative_decision = engine::advance_until_decision(&mut root_binding);
         if root_binding != *root_state || authoritative_decision != root_decision {
@@ -338,12 +374,99 @@ impl DynamicEngineSearchV1 {
             nodes: vec![root],
             root: 0,
             root_player,
+            successor_value_mode,
             metrics: DynamicSearchMetricsV1 {
                 admitted_actions: admitted,
                 state_clones: 1,
                 ..Default::default()
             },
         })
+    }
+
+    pub(crate) fn root_bounds_v1(&self) -> BoundIntervalV1 {
+        self.nodes[self.root].bounds
+    }
+
+    pub(crate) fn metrics_v1(&self) -> &DynamicSearchMetricsV1 {
+        &self.metrics
+    }
+
+    pub(crate) fn node_kind_counts_v1(&self) -> (u64, u64, u64) {
+        self.nodes
+            .iter()
+            .fold((0, 0, 0), |(games, constructions, terminals), node| {
+                if node.terminal {
+                    (games, constructions, terminals + 1)
+                } else if node.construction_context.is_some() {
+                    (games, constructions + 1, terminals)
+                } else {
+                    (games + 1, constructions, terminals)
+                }
+            })
+    }
+
+    pub(crate) fn root_is_terminal_v1(&self) -> bool {
+        self.nodes[self.root].terminal
+    }
+
+    pub(crate) fn role_node_counts_v1(&self) -> (u64, u64) {
+        self.nodes
+            .iter()
+            .fold((0, 0), |(max_count, min_count), node| match node.role {
+                Some(MadsRoleV1::Max) => (max_count + 1, min_count),
+                Some(MadsRoleV1::Min) => (max_count, min_count + 1),
+                None => (max_count, min_count),
+            })
+    }
+
+    pub(crate) fn next_task_descriptor_v1(&self) -> Option<DynamicSearchTaskDescriptorV1> {
+        let frontier = if self.successor_value_mode {
+            self.build_successor_value_frontier_v1()
+        } else {
+            self.build_frontier_v1()
+        };
+        let task = frontier
+            .into_values()
+            .min_by_key(DynamicExpansionTask::sort_key)?;
+        let node = &self.nodes[task.owner];
+        let slot = node.slots.get(task.slot)?;
+        Some(DynamicSearchTaskDescriptorV1 {
+            owner_semantic_path: task.owner_semantic_path,
+            action_order: u32::try_from(task.slot).ok()?,
+            action_id: slot.id.clone(),
+            actor: node.actor?,
+            role_mask: task.role_mask,
+            bound_width: task.bound_width,
+            min_root_distance: task.min_root_distance,
+            estimated_cost_bucket: task.estimated_cost_bucket,
+        })
+    }
+
+    /// Revalidates and executes exactly the currently selected internal V1
+    /// task, even if that local subproblem already has an anytime certificate.
+    /// Outer MADS-04 may still need the successor interval to close another
+    /// complete physical-root alternative.
+    pub(crate) fn expand_task_descriptor_v1(
+        &mut self,
+        expected: &DynamicSearchTaskDescriptorV1,
+    ) -> Result<(), DynamicSearchStatusV1> {
+        self.metrics.scheduler_rebuilds += 1;
+        if self.next_task_descriptor_v1().as_ref() != Some(expected) {
+            return Err(DynamicSearchStatusV1::UnresolvedWithinBudget);
+        }
+        let Some((owner, slot)) = self.nodes.iter().enumerate().find_map(|(owner, node)| {
+            (node.semantic_path == expected.owner_semantic_path)
+                .then(|| {
+                    node.slots
+                        .iter()
+                        .position(|slot| slot.id == expected.action_id && slot.child.is_none())
+                        .map(|slot| (owner, slot))
+                })
+                .flatten()
+        }) else {
+            return Err(DynamicSearchStatusV1::UnresolvedWithinBudget);
+        };
+        self.expand_slot_v1(owner, slot)
     }
 
     pub fn run_v1(&mut self, compute_budget: usize) -> DynamicSearchResultV1 {
@@ -462,6 +585,50 @@ impl DynamicEngineSearchV1 {
                 &mut std::collections::BTreeSet::new(),
                 &mut tasks,
             );
+        }
+        tasks
+    }
+
+    /// Bound-support frontier for a local successor value search. Unlike V1's
+    /// public root-action scheduler, this tracks both lower and upper support
+    /// of the whole successor interval and respects a MIN root's role.
+    fn build_successor_value_frontier_v1(
+        &self,
+    ) -> std::collections::BTreeMap<(usize, usize), DynamicExpansionTask> {
+        let root = &self.nodes[self.root];
+        let Some(role) = root.role else {
+            return std::collections::BTreeMap::new();
+        };
+        let mut tasks = std::collections::BTreeMap::<(usize, usize), DynamicExpansionTask>::new();
+        for lower_support in [true, false] {
+            for (slot_index, slot) in root.slots.iter().enumerate() {
+                if let Some(child) = slot.child {
+                    if critical_support_v1(
+                        role,
+                        lower_support,
+                        root.bounds,
+                        Some(self.nodes[child].bounds),
+                    ) {
+                        self.collect_dynamic_support(
+                            child,
+                            lower_support,
+                            slot_index,
+                            1,
+                            &mut std::collections::BTreeSet::new(),
+                            &mut tasks,
+                        );
+                    }
+                } else if critical_support_v1(role, lower_support, root.bounds, None) {
+                    self.insert_dynamic_task(
+                        &mut tasks,
+                        self.root,
+                        slot_index,
+                        lower_support,
+                        slot_index,
+                        0,
+                    );
+                }
+            }
         }
         tasks
     }
